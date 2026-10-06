@@ -26,8 +26,6 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 #include <util/align.h>
-
-#include <set>
 #include <util/log.h>
 #include <util/vector_utils.h>
 
@@ -444,19 +442,6 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
             && ite->second->stride_bytes == stride_bytes) {
             found = true;
             break;
-        }
-    }
-
-    // DIAGNOSTIC: one line per distinct surface-as-texture lookup and how it resolved
-    {
-        const uint64_t d_key = (static_cast<uint64_t>(base_format) << 32) ^ (static_cast<uint64_t>(stride_bytes) << 16)
-            ^ (static_cast<uint64_t>(original_width) << 8) ^ original_height ^ (static_cast<uint64_t>(tiling) << 48);
-        static std::set<uint64_t> d_seen;
-        if (d_seen.insert(d_key).second) {
-            const char *outcome = !found ? "MISS-no-matching-surface" : (*ite->second->dirty ? "MISS-dirty" : "HIT");
-            LOG_INFO("SURFDIAG {} base=0x{:08X} tiling={} stride={} {}x{}",
-                outcome, static_cast<uint32_t>(base_format), static_cast<int>(tiling),
-                stride_bytes, original_width, original_height);
         }
     }
 
