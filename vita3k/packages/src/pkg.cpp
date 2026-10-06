@@ -34,6 +34,14 @@
 #include <packages/functions.h>
 #include <packages/license.h>
 #include <packages/pkg.h>
+
+#include <platform/platform.h>
+
+#include <chrono>
+#ifdef __PROSPERO__
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <packages/sce_types.h>
 #include <packages/sfo.h>
 
@@ -83,7 +91,76 @@ bool decrypt_install_nonpdrm(EmuEnvState &emuenv, const fs::path &drmlicpath, co
     return true;
 }
 
-bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_zRIF, const std::function<void(float)> &progress_callback) {
+// Writes one file out of a package. A game's data files run to hundreds of megabytes, and writing one in pieces
+// makes the filesystem extend it again on every piece. Where the final size is known up front the file is claimed
+// in one go first, so the writes that follow only fill space that already belongs to it
+class PackageFileWriter {
+public:
+    PackageFileWriter(const fs::path &path, std::uint64_t total) {
+#ifdef __PROSPERO__
+        m_fd = ::open(fs_utils::path_to_utf8(path).c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (m_fd >= 0 && total > 0 && ::ftruncate(m_fd, static_cast<off_t>(total)) != 0)
+            LOG_WARN("Could not claim {} bytes for {} up front", total, path);
+#else
+        (void)total;
+        m_stream.open(path, std::ios::binary);
+#endif
+    }
+
+    ~PackageFileWriter() {
+        close();
+    }
+
+    PackageFileWriter(const PackageFileWriter &) = delete;
+    PackageFileWriter &operator=(const PackageFileWriter &) = delete;
+
+    bool write(const void *data, std::size_t size) {
+#ifdef __PROSPERO__
+        const auto *bytes = static_cast<const std::uint8_t *>(data);
+        while (size > 0) {
+            const ssize_t written = ::write(m_fd, bytes, size);
+            if (written <= 0)
+                return false;
+            bytes += written;
+            size -= static_cast<std::size_t>(written);
+            m_unflushed += static_cast<std::uint64_t>(written);
+        }
+        // A game's worth of writing left unflushed slows to a crawl partway through, as what is waiting to be
+        // written outgrows the room the system keeps for it. Handing it over in runs keeps that bounded
+        if (m_unflushed >= FLUSH_EVERY) {
+            ::fsync(m_fd);
+            m_unflushed = 0;
+        }
+        return true;
+#else
+        m_stream.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
+        return m_stream.good();
+#endif
+    }
+
+    void close() {
+#ifdef __PROSPERO__
+        if (m_fd >= 0) {
+            ::close(m_fd);
+            m_fd = -1;
+        }
+#else
+        if (m_stream.is_open())
+            m_stream.close();
+#endif
+    }
+
+private:
+#ifdef __PROSPERO__
+    static constexpr std::uint64_t FLUSH_EVERY = 64u << 20;
+    int m_fd = -1;
+    std::uint64_t m_unflushed = 0;
+#else
+    fs::ofstream m_stream;
+#endif
+};
+
+bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_zRIF, const std::function<void(float)> &progress_callback, const std::function<void(const std::string &, float)> &item_callback, const std::function<bool()> &cancelled) {
     FILE *infile = FOPEN(pkg_path.c_str(), "rb");
     if (!infile) {
         LOG_CRITICAL("Failed to load pkg file in path: {}", fs_utils::path_to_utf8(pkg_path));
@@ -251,7 +328,8 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
         EVP_DecryptFinal_ex(cipher_ctx, data + dec_len, &dec_len);
     };
 
-    std::vector<uint8_t> buffer(0x10000);
+    // Each pass over this buffer is a read, a decrypt and a write, so a larger one makes fewer round trips
+    std::vector<uint8_t> buffer(0x200000);
     for (uint32_t i = 0; i < byte_swap(pkg_header.file_count); i++) {
         PkgEntry entry;
         uint64_t file_offset = items_offset + i * 32;
@@ -275,14 +353,15 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
 
         auto string_name = std::string(name.begin(), name.end());
         LOG_INFO(string_name);
+        if (item_callback)
+            item_callback(string_name, 0.f);
 
         if ((byte_swap(entry.type) & 0xFF) == 4 || (byte_swap(entry.type) & 0xFF) == 18) { // Directory
             fs::create_directories(path / string_name);
         } else { // File
-            fs::ofstream outfile(path / string_name, std::ios::binary);
-
             auto offset = byte_swap(entry.data_offset);
             auto data_size = byte_swap(entry.data_size);
+            PackageFileWriter outfile(path / string_name, data_size);
 
             uint8_t counter[0x10];
             ctr_init(counter, pkg_header.pkg_data_iv, offset / 16);
@@ -290,18 +369,51 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
             EVP_CIPHER_CTX_set_padding(cipher_ctx, 0);
 
             fseek(infile, byte_swap(pkg_header.data_offset) + offset, SEEK_SET);
+            // A game's largest files run to hundreds of megabytes, so the share of this one that is done counts
+            // towards the whole: without it the report stands still for as long as one file takes
+            const float file_share = 100.f * 0.6f / file_count;
+            const uint64_t file_bytes = data_size;
+            // Where a large file's time actually goes, so a slow install can be blamed on the right step
+            std::chrono::nanoseconds reading{ 0 }, decrypting{ 0 }, writing{ 0 };
             while (data_size != 0) {
                 size_t size = data_size < buffer.size() ? data_size : buffer.size();
+                auto mark = std::chrono::steady_clock::now();
                 fread(buffer.data(), size, 1, infile);
+                const auto read_done = std::chrono::steady_clock::now();
+                reading += read_done - mark;
 
                 EVP_DecryptUpdate(cipher_ctx, buffer.data(), &dec_len, buffer.data(), size);
+                const auto decrypt_done = std::chrono::steady_clock::now();
+                decrypting += decrypt_done - read_done;
 
-                outfile.write(reinterpret_cast<char *>(buffer.data()), dec_len);
+                outfile.write(buffer.data(), dec_len);
+                writing += std::chrono::steady_clock::now() - decrypt_done;
                 data_size -= size;
+                const float of_this_file = static_cast<float>(file_bytes - data_size) / static_cast<float>(file_bytes);
+                progress_callback(i / file_count * 100.f * 0.6f + file_share * of_this_file);
+                if (item_callback)
+                    item_callback(string_name, of_this_file);
+                if (cancelled && cancelled()) {
+                    // Leave nothing half written behind: what was unpacked so far is of no use on its own
+                    outfile.close();
+                    fclose(infile);
+                    evp_cleanup();
+                    LOG_INFO("Installation of {} cancelled", pkg_path);
+                    // The console has refused a removal before now, and throwing here would take the emulator with it
+                    if (const int left = platform::remove_tree(fs_utils::path_to_utf8(path)); left > 0)
+                        LOG_WARN("{} entries of {} would not go", left, path);
+                    return false;
+                }
+            }
+
+            if (file_bytes >= (32u << 20)) {
+                const auto ms = [](std::chrono::nanoseconds d) { return std::chrono::duration<double, std::milli>(d).count(); };
+                LOG_INFO("{} ({} MB): read {:.0f} ms, decrypt {:.0f} ms, write {:.0f} ms", string_name,
+                    file_bytes >> 20, ms(reading), ms(decrypting), ms(writing));
             }
 
             EVP_DecryptFinal_ex(cipher_ctx, buffer.data(), &dec_len);
-            outfile.write(reinterpret_cast<char *>(buffer.data()), dec_len);
+            outfile.write(buffer.data(), dec_len);
             outfile.close();
         }
     }
@@ -315,27 +427,54 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
     std::string f00d_arg = std::string();
 
     progress_callback(80);
+    // Decrypting is the rest of the work and used to report nothing, so the bar sat at 80 until it was done
+    // The decryption reports once per file, with the bytes done so far out of the whole. There is nothing finer to
+    // show inside one file, so the row for the file being worked on carries how far through the whole it is, which
+    // at least moves while a large one is being written
+    const auto decrypt_started = std::chrono::steady_clock::now();
+    auto last_report = decrypt_started;
+    std::uint64_t last_processed = 0;
+    const auto pfs_progress = [&](std::uint64_t processed, std::uint64_t total, const std::string &file) {
+        const float done = total > 0 ? static_cast<float>(processed) / static_cast<float>(total) : 0.f;
+        progress_callback(80.f + 20.f * done);
+        if (item_callback && !file.empty())
+            item_callback(file, done);
+
+        // How fast the decryption is actually going, once every few seconds
+        const auto now = std::chrono::steady_clock::now();
+        const double since = std::chrono::duration<double>(now - last_report).count();
+        if (since >= 5.0) {
+            LOG_INFO("Decrypting at {:.1f} MB/s ({} of {} MB)", (processed - last_processed) / 1e6 / since,
+                processed >> 20, total >> 20);
+            last_report = now;
+            last_processed = processed;
+        }
+    };
+
     switch (type) {
     case PkgType::PKG_TYPE_VITA_APP:
     case PkgType::PKG_TYPE_VITA_PATCH:
 
-        if (execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg) < 0) {
-            fs::remove_all(fs::path(title_id_src));
-            fs::remove_all(fs::path(title_id_dst));
-            return false;
+        if (execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg, pfs_progress) < 0) {
+            // The package has already been unpacked and its own layer of encryption taken off. This second pass is
+            // the one that failed, so what was written stays: throwing away a game's worth of work would be worse
+            // than handing over content that may or may not need it. Only the half-made copy goes
+            LOG_ERROR("The PFS layer of {} could not be decrypted; keeping what was unpacked", title_id_src);
+            platform::remove_tree(fs_utils::path_to_utf8(title_id_dst));
+            return true;
         }
-        fs::remove_all(title_id_src);
+        platform::remove_tree(fs_utils::path_to_utf8(title_id_src));
         fs::rename(title_id_dst, title_id_src);
 
         break;
     case PkgType::PKG_TYPE_VITA_DLC:
 
-        if (execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg) < 0) {
-            fs::remove_all(fs::path(title_id_src));
-            fs::remove_all(fs::path(title_id_dst));
+        if (execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg, pfs_progress) < 0) {
+            platform::remove_tree(fs_utils::path_to_utf8(title_id_src));
+            platform::remove_tree(fs_utils::path_to_utf8(title_id_dst));
             return false;
         } else {
-            fs::remove_all(title_id_src);
+            platform::remove_tree(fs_utils::path_to_utf8(title_id_src));
             fs::rename(title_id_dst, title_id_src);
             return true;
         }
@@ -344,8 +483,8 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
     case PkgType::PKG_TYPE_VITA_THEME:
 
         // Theme don't have keystone file, need skip error
-        execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg);
-        fs::remove_all(title_id_src);
+        execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg, pfs_progress);
+        platform::remove_tree(fs_utils::path_to_utf8(title_id_src));
         fs::rename(title_id_dst, title_id_src);
         return true;
         break;
@@ -358,6 +497,28 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
 
     progress_callback(100);
     return true;
+}
+
+// How fast this build can actually decrypt. Installing a package is almost entirely AES, and OpenSSL picks its
+// hardware implementation from a CPUID check that runs as the library starts. Where that check never runs it falls
+// back to portable C an order of magnitude slower, and this tells the two apart: hardware AES reaches gigabytes a
+// second, the fallback tens of megabytes
+void report_crypto_speed() {
+    constexpr int BYTES = 16 << 20;
+    std::vector<unsigned char> data(BYTES, 0x5a);
+    unsigned char key[32] = {}, iv[16] = {};
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    EVP_CIPHER *cipher = EVP_CIPHER_fetch(nullptr, "AES-256-CTR", nullptr);
+    const auto started = std::chrono::steady_clock::now();
+    int length = 0;
+    if (ctx && cipher && EVP_EncryptInit_ex(ctx, cipher, nullptr, key, iv) == 1)
+        EVP_EncryptUpdate(ctx, data.data(), &length, data.data(), BYTES);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    EVP_CIPHER_free(cipher);
+    EVP_CIPHER_CTX_free(ctx);
+
+    LOG_INFO("Crypto: AES-256-CTR at {:.0f} MB/s", seconds > 0 ? BYTES / 1e6 / seconds : 0.0);
 }
 
 std::string find_pkg_zrif(const fs::path &pkg_path, const fs::path &vita_fs_path) {

@@ -40,8 +40,10 @@ std::vector<std::string> fontmgr::s_system_font_dirs;
 std::string fontmgr::s_firmware_font_dir;
 int fontmgr::s_system_lang = 0;
 
+// A name that cannot be looked up (a bare font name is a relative path, which the PS5 refuses) is not a file
 static bool file_exists(const std::string &path) {
-    return fs::exists(fs::path(path));
+    boost::system::error_code error;
+    return fs::exists(fs::path(path), error);
 }
 
 void codepage::initialize_glyphs(char32_t codepage_id, float font_size, const std::vector<uint8_t> &ttf_data, int font_index) {

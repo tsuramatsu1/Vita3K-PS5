@@ -16,6 +16,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <ctrl/state.h>
+#include <util/log.h>
 #include <dialog/state.h>
 #include <display/functions.h>
 #include <display/state.h>
@@ -353,6 +354,15 @@ int touch_get(const SceUID thread_id, EmuEnvState &emuenv, const SceUInt32 &port
             corr_buffer_idx %= MAX_TOUCH_BUFFER_SAVED;
         }
     }
+
+    // What a game is actually handed when it asks, which tells a touch that never reaches it from one it ignores
+    static uint64_t asked = 0, with_a_finger = 0;
+    asked++;
+    if (nb_returned_data > 0 && pData[0].reportNum > 0)
+        with_a_finger++;
+    if (asked % 600 == 0)
+        LOG_DEBUG("Touch reads on port {}: {} of the last {} carried a finger, sampling {}, touchpad {}", port_idx,
+            with_a_finger, asked, static_cast<int>(emuenv.touch.touch_mode[port_idx]), emuenv.touch.is_touchpad);
 
     return nb_returned_data;
 }

@@ -36,6 +36,30 @@ set(CMAKE_FOLDER externals)
 option(BUILD_SHARED_LIBS "Build shared library" OFF)
 option(CAPSTONE_ARCHITECTURE_DEFAULT "Whether architectures are enabled by default" OFF)
 option(CAPSTONE_ARM_SUPPORT "ARM support" ON)
+if(VITA3K_PS5_PORT)
+	# The payload SDK fork's platform layer, whose title heap serves every malloc, is dlmalloc and exports the mspace
+	# functions external/dlmalloc does. Vita3K's copy would take the heap's own calls, and it maps with mmap, which a
+	# title cannot: every allocation would fall back to libc's small heap. A copy of the library with its dlmalloc
+	# renamed keeps the two apart, and everything here links that copy as the ps5platform target
+	set(PS5_PLATFORM_LIBRARY "${CMAKE_BINARY_DIR}/external/libps5platform.a")
+	find_program(PS5_OBJCOPY NAMES llvm-objcopy llvm-objcopy-18 REQUIRED)
+	set(PS5_PLATFORM_RENAMES)
+	foreach(function create_mspace create_mspace_with_base destroy_mspace mspace_calloc mspace_footprint mspace_free
+			mspace_independent_calloc mspace_independent_comalloc mspace_mallinfo mspace_malloc mspace_malloc_stats
+			mspace_mallopt mspace_max_footprint mspace_memalign mspace_realloc mspace_track_large_chunks mspace_trim
+			mspace_usable_size mspace_bulk_free mspace_realloc_in_place mspace_footprint_limit mspace_set_footprint_limit)
+		list(APPEND PS5_PLATFORM_RENAMES --redefine-sym ${function}=ps5p_${function})
+	endforeach()
+	execute_process(
+		COMMAND ${PS5_OBJCOPY} ${PS5_PLATFORM_RENAMES} "${PS5_PAYLOAD_SDK}/target/lib/libps5platform.a" "${PS5_PLATFORM_LIBRARY}"
+		RESULT_VARIABLE PS5_PLATFORM_RESULT)
+	if(NOT PS5_PLATFORM_RESULT EQUAL 0)
+		message(FATAL_ERROR "Renaming the platform layer's dlmalloc failed (${PS5_PLATFORM_RESULT})")
+	endif()
+	add_library(ps5platform STATIC IMPORTED GLOBAL)
+	set_target_properties(ps5platform PROPERTIES IMPORTED_LOCATION "${PS5_PLATFORM_LIBRARY}")
+endif()
+
 add_subdirectory(capstone EXCLUDE_FROM_ALL)
 
 add_library(dirent INTERFACE)
@@ -48,12 +72,26 @@ add_library(printf INTERFACE)
 target_include_directories(printf INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/printf")
 
 set(FMT_INSTALL ON)
+if(VITA3K_PS5_PORT)
+	# The SDK ships no clang-scan-deps to build C++ modules with
+	set(FMT_MODULE OFF)
+endif()
 add_subdirectory(fmt)
 set(fmt_DIR fmt)
+if(VITA3K_PS5_PORT)
+	# fmt prints to a FILE by writing through the stream's own buffer, reached through the fields of __sFILE. A PS5
+	# title's stderr carries no such buffer, so the text goes to whatever address those fields hold and faults. The
+	# fallback writes with fwrite instead
+	target_compile_definitions(fmt PUBLIC FMT_USE_FALLBACK_FILE=1)
+endif()
 
 set(SPDLOG_WCHAR_FILENAMES ON CACHE BOOL "")
 set(SPDLOG_NO_THREAD_ID ON CACHE BOOL "")
 set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "")
+if(VITA3K_PS5_PORT)
+	# The console's libc does not export fwrite_unlocked
+	set(SPDLOG_FWRITE_UNLOCKED OFF)
+endif()
 add_subdirectory(spdlog EXCLUDE_FROM_ALL)
 
 add_subdirectory(substitute EXCLUDE_FROM_ALL)
@@ -83,6 +121,18 @@ add_subdirectory(libfat16)
 add_library(miniz STATIC miniz/miniz.c miniz/miniz.h)
 target_include_directories(miniz PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/miniz")
 
+if(VITA3K_PS5_PORT)
+	# The PS5 has no X11 or Wayland: the window is VideoOut, owned by the Vulkan driver's display WSI
+	set(SDL_UNIX_CONSOLE_BUILD ON)
+	set(SDL_HIDAPI OFF)
+	# FreeBSD's USB HID joysticks: the SDK has the headers but no libusbhid, which checks that do not link miss
+	set(HAVE_USBHID FALSE CACHE INTERNAL "")
+	set(SDL_OSS OFF)
+	set(SDL_OPENGLES OFF)
+	set(SDL_TESTS OFF)
+	set(SDL_TEST_LIBRARY OFF)
+endif()
+
 add_subdirectory(sdl)
 
 # Cubeb setup, from https://github.com/RPCS3/rpcs3/blob/master/3rdparty/cubeb/CMakeLists.txt
@@ -93,6 +143,11 @@ set(BUILD_TOOLS FALSE CACHE BOOL "Don't build tools")
 set(BUNDLE_SPEEX TRUE CACHE BOOL "Bundle the speex library")
 set(LAZY_LOAD_LIBS TRUE CACHE BOOL "Lazily load shared libraries")
 set(USE_SANITIZERS FALSE CACHE BOOL "Dont't use sanitizers")
+
+if(VITA3K_PS5_PORT)
+	# The console's FreeBSD userland has the OSS headers but no OSS devices
+	set(HAVE_SYS_SOUNDCARD_H FALSE CACHE INTERNAL "")
+endif()
 
 add_subdirectory(cubeb EXCLUDE_FROM_ALL)
 
@@ -128,6 +183,10 @@ set(DYNARMIC_TESTS OFF CACHE BOOL "")
 set(DYNARMIC_NO_BUNDLED_FMT ON CACHE BOOL "")
 set(DYNARMIC_FRONTENDS "A32" CACHE STRING "")
 add_subdirectory(dynarmic)
+if(VITA3K_PS5_PORT)
+	# Its code cache is direct memory from the payload SDK fork's platform layer (ps5platform/exec.h)
+	target_link_libraries(dynarmic PRIVATE ps5platform)
+endif()
 
 if(MSVC)
 	if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -273,7 +332,11 @@ target_include_directories(vma INTERFACE
 if(ANDROID)
 	set(USE_STATIC_ANDROID_FFMPEG ON)
 endif()
-add_subdirectory(ffmpeg)
+if(VITA3K_PS5_PORT)
+	include(${CMAKE_SOURCE_DIR}/cmake/ps5-ffmpeg.cmake)
+else()
+	add_subdirectory(ffmpeg)
+endif()
 
 if(APPLE OR NOT FORCE_BUILD_OPENSSL_MAC)
 	execute_process(
@@ -288,7 +351,8 @@ if(APPLE OR NOT FORCE_BUILD_OPENSSL_MAC)
 	endif()
 endif()
 
-if(NOT FORCE_BUILD_OPENSSL_MAC)
+# The PS5 SDK has no OpenSSL of its own: it is always built below
+if(NOT FORCE_BUILD_OPENSSL_MAC AND NOT VITA3K_PS5_PORT)
 	find_package(OpenSSL QUIET)
 endif()
 
@@ -350,6 +414,50 @@ if(NOT OPENSSL_FOUND OR FORCE_BUILD_OPENSSL_MAC)
 
 		set(OPENSSL_ROOT_DIR "${CMAKE_BINARY_DIR}/external/openssl")
 		set(OPENSSL_USE_STATIC_LIBS TRUE)
+	elseif(VITA3K_PS5_PORT)
+		set(OPENSSL_PS5_DIR "${CMAKE_BINARY_DIR}/external/openssl")
+		if(NOT EXISTS "${CMAKE_BINARY_DIR}/external/openssl.tar.gz")
+			message(STATUS "Downloading OpenSSL@4 from source...")
+			file(DOWNLOAD https://github.com/openssl/openssl/releases/download/openssl-4.0.1/openssl-4.0.1.tar.gz
+				"${CMAKE_BINARY_DIR}/external/openssl.tar.gz"
+				SHOW_PROGRESS
+				EXPECTED_HASH SHA256=2db3f3a0d6ea4b59e1f094ace2c8cd536dffb87cdc39084c5afa1e6f7f37dd09)
+		endif()
+
+		if(NOT EXISTS "${OPENSSL_PS5_DIR}")
+			file(MAKE_DIRECTORY "${OPENSSL_PS5_DIR}")
+			execute_process(COMMAND tar xfp "${CMAKE_BINARY_DIR}/external/openssl.tar.gz" -C openssl --strip-components=1
+				WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/external")
+		endif()
+
+		if(NOT EXISTS "${OPENSSL_PS5_DIR}/libssl.a" OR NOT EXISTS "${OPENSSL_PS5_DIR}/libcrypto.a")
+			message(STATUS "Building OpenSSL@4 for the PS5...")
+			# The console runs FreeBSD userland on x86_64. Secure memory needs mlock, which payloads cannot rely on
+			execute_process(
+				COMMAND ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER} AR=${CMAKE_AR} RANLIB=${CMAKE_RANLIB}
+					perl Configure BSD-x86_64 no-shared no-module no-dso no-tests no-docs no-apps no-async
+					no-ui-console no-secure-memory
+					# The console's libc declares sendmmsg and recvmmsg but does not export them
+					-DNO_RECVMMSG
+				WORKING_DIRECTORY "${OPENSSL_PS5_DIR}"
+				OUTPUT_QUIET
+				RESULT_VARIABLE OPENSSL_PS5_RESULT)
+			if(OPENSSL_PS5_RESULT EQUAL 0)
+				execute_process(COMMAND make -j${CPU_COUNT} build_libs
+					WORKING_DIRECTORY "${OPENSSL_PS5_DIR}"
+					OUTPUT_QUIET
+					RESULT_VARIABLE OPENSSL_PS5_RESULT)
+			endif()
+			if(NOT OPENSSL_PS5_RESULT EQUAL 0)
+				message(FATAL_ERROR "Building OpenSSL for the PS5 failed (${OPENSSL_PS5_RESULT})")
+			endif()
+		endif()
+
+		# The toolchain only searches its sysroot, so name the build tree's OpenSSL directly
+		set(OPENSSL_USE_STATIC_LIBS TRUE)
+		set(OPENSSL_INCLUDE_DIR "${OPENSSL_PS5_DIR}/include" CACHE PATH "" FORCE)
+		set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_PS5_DIR}/libcrypto.a" CACHE FILEPATH "" FORCE)
+		set(OPENSSL_SSL_LIBRARY "${OPENSSL_PS5_DIR}/libssl.a" CACHE FILEPATH "" FORCE)
 	endif()
 	find_package(OpenSSL REQUIRED)
 endif()
@@ -364,6 +472,11 @@ target_link_libraries(crypto INTERFACE OpenSSL::Crypto)
 
 # Must be after openssl
 add_subdirectory(psvpfstools)
+if(VITA3K_PS5_PORT)
+	# psvpfstools links a prebuilt host libz. The PS5 title carries zlib already, in the RADV archive it links
+	# whole, so only zlib's headers are needed here
+	set_property(TARGET zlib PROPERTY INTERFACE_LINK_LIBRARIES "")
+endif()
 
 find_package(CURL QUIET)
 if(NOT CURL_FOUND)
@@ -384,6 +497,11 @@ if(NOT CURL_FOUND)
 	option(BUILD_TESTING "Build tests" OFF)
 	option(BUILD_EXAMPLES "Build libcurl examples" OFF)
 	option(CURL_USE_LIBPSL "Use libpsl" OFF)
+	if(VITA3K_PS5_PORT)
+		# Declared by the console's libc headers but not exported
+		set(HAVE_PIPE2 FALSE CACHE INTERNAL "")
+		set(HAVE_IF_NAMETOINDEX FALSE CACHE INTERNAL "")
+	endif()
 	FetchContent_Declare(curl
 		GIT_REPOSITORY https://github.com/curl/curl.git
 		GIT_TAG        68720b4837284335b2d63cb358f8f6ce65f5bc55 # release 8.21.0
@@ -406,7 +524,8 @@ target_include_directories(libatrac9 PUBLIC LibAtrac9/C/src)
 option(BUILD_SHARED_LIBS "Build shared library" OFF)
 option(XXHASH_BUILD_XXHSUM "Build the xxhsum binary" OFF)
 option(XXH_X86DISPATCH_ALLOW_AVX "Allow building XXH3 with AVX even if it crashes on SSE2-Only CPUs" OFF)
-if((NOT APPLE) AND (ARCHITECTURE STREQUAL "x86_64"))
+# The PS5's CPU is fixed, so it needs no runtime dispatch
+if((NOT APPLE) AND (NOT VITA3K_PS5_PORT) AND (ARCHITECTURE STREQUAL "x86_64"))
 	set(DISPATCH 1)
 endif()
 add_subdirectory(xxHash/cmake_unofficial EXCLUDE_FROM_ALL)
@@ -467,7 +586,7 @@ endif()
 # Use XDG desktop portals on Linux
 set(NFD_PORTAL ON)
 
-if(NOT ANDROID)
+if(NOT ANDROID AND NOT VITA3K_PS5_PORT)
 	# nativefiledialog-extended
 	add_subdirectory(nativefiledialog-extended)
 

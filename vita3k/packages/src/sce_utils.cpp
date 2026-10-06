@@ -28,7 +28,11 @@
 
 #include <self.h>
 
+#include <algorithm>
+#include <array>
+#include <cstring>
 #include <fstream>
+#include <vector>
 
 // Credits to TeamMolecule for their original work on this https://github.com/TeamMolecule/sceutils
 
@@ -652,19 +656,87 @@ static void traverse_directory(Fat16::Image &img, Fat16::Entry mee, const fs::pa
     }
 }
 
+namespace {
+
+// The image as libfat16 reads it, through a small cache of its blocks. The reader walks a file's cluster chain from
+// its start for every chunk it reads, each step a seek and a two-byte read of the FAT, so straight file calls make
+// the extraction quadratic in system calls, minutes for vs0 where file calls are slow
+class CachedImage {
+public:
+    explicit CachedImage(FILE *file)
+        : file(file) {
+        fseek(file, 0, SEEK_END);
+        size = static_cast<std::uint64_t>(ftell(file));
+    }
+
+    std::uint32_t read(void *buffer, std::uint32_t length) {
+        auto *out = static_cast<std::uint8_t *>(buffer);
+        std::uint32_t done = 0;
+        while (done < length && position < size) {
+            const Block &block = load(position / BLOCK_SIZE);
+            const std::uint64_t within = position % BLOCK_SIZE;
+            const std::uint64_t take = std::min<std::uint64_t>({ length - done, block.length - within, size - position });
+            if (take == 0)
+                break;
+            std::memcpy(out + done, block.data.data() + within, take);
+            done += static_cast<std::uint32_t>(take);
+            position += take;
+        }
+        return done;
+    }
+
+    std::uint32_t seek(std::uint32_t offset, int mode) {
+        if (mode == Fat16::IMAGE_SEEK_MODE_BEG)
+            position = offset;
+        else if (mode == Fat16::IMAGE_SEEK_MODE_CUR)
+            position += offset;
+        else
+            position = size + offset;
+        return static_cast<std::uint32_t>(position);
+    }
+
+private:
+    static constexpr std::uint64_t BLOCK_SIZE = 0x10000;
+    static constexpr std::size_t BLOCK_COUNT = 64;
+
+    struct Block {
+        std::uint64_t index = UINT64_MAX;
+        std::uint64_t length = 0;
+        std::vector<std::uint8_t> data;
+    };
+
+    // Direct-mapped: the FAT stays in its slots while the data streams through the others
+    const Block &load(std::uint64_t index) {
+        Block &block = blocks[index % BLOCK_COUNT];
+        if (block.index != index) {
+            block.data.resize(BLOCK_SIZE);
+            fseek(file, static_cast<long>(index * BLOCK_SIZE), SEEK_SET);
+            block.length = fread(block.data.data(), 1, BLOCK_SIZE, file);
+            block.index = index;
+        }
+        return block;
+    }
+
+    FILE *file;
+    std::uint64_t size = 0;
+    std::uint64_t position = 0;
+    std::array<Block, BLOCK_COUNT> blocks;
+};
+
+} // namespace
+
 void extract_fat(const fs::path &partition_path, const std::string &partition, const fs::path &vita_fs_path) {
     FILE *f = FOPEN((partition_path / partition).native().c_str(), "rb");
+    CachedImage image(f);
     Fat16::Image img(
-        f,
+        &image,
         // Read hook
         [](void *userdata, void *buffer, std::uint32_t size) -> std::uint32_t {
-            return static_cast<std::uint32_t>(fread(buffer, 1, size, (FILE *)userdata));
+            return static_cast<CachedImage *>(userdata)->read(buffer, size);
         },
         // Seek hook
         [](void *userdata, std::uint32_t offset, int mode) -> std::uint32_t {
-            fseek((FILE *)userdata, offset, (mode == Fat16::IMAGE_SEEK_MODE_BEG ? SEEK_SET : (mode == Fat16::IMAGE_SEEK_MODE_CUR ? SEEK_CUR : SEEK_END)));
-
-            return ftell((FILE *)userdata);
+            return static_cast<CachedImage *>(userdata)->seek(offset, mode);
         });
 
     Fat16::Entry first;
@@ -1140,7 +1212,9 @@ void decrypt_selfs(const fs::path &input_path, const fs::path &cache_path, const
             }
 
             // Write the decrypted self to the output path
-            const auto output_file_path = output_path / fs::relative(entry.path(), input_path);
+            // Worked out from the paths rather than from the disk: relative() canonicalises both, which a
+            // sandboxed process can be refused, and the entry is known to lie under input_path
+            const auto output_file_path = output_path / entry.path().lexically_relative(input_path);
             fs::create_directories(output_file_path.parent_path());
             fs::ofstream out(output_file_path, std::ios::binary);
             if (!out) {
@@ -1148,7 +1222,7 @@ void decrypt_selfs(const fs::path &input_path, const fs::path &cache_path, const
                 continue;
             }
             out.write(reinterpret_cast<const char *>(fself.data()), fself.size());
-            const auto out_rel = fs::relative(output_file_path, cache_path);
+            const auto out_rel = output_file_path.lexically_relative(cache_path);
             LOG_INFO("Decrypted self to {}", fs_utils::path_to_utf8(out_rel));
         }
     }

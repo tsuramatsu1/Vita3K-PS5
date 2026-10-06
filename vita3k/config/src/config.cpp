@@ -223,7 +223,10 @@ static bool load_new_config(Config &self, const fs::path &path) {
 
 static std::set<std::string> get_file_set(const fs::path &loc, bool dirs_only = true) {
     std::set<std::string> cur_set{};
-    if (!fs::exists(loc)) {
+    // A path that cannot be checked holds no apps: before the config sets the Vita FS path, it is relative, which
+    // the PS5 refuses to look up
+    boost::system::error_code exists_error{};
+    if (!fs::exists(loc, exists_error)) {
         return cur_set;
     }
 

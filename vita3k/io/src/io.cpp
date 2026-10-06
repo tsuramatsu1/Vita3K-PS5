@@ -41,7 +41,8 @@
 #include <iterator>
 #include <string>
 
-#if defined(__aarch64__) && defined(__APPLE__)
+// FreeBSD's stat is 64-bit and it has no stat64
+#if (defined(__aarch64__) && defined(__APPLE__)) || defined(__FreeBSD__)
 #define stat64 stat
 #endif
 

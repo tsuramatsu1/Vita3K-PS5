@@ -23,7 +23,10 @@
 #include <display/functions.h>
 #include <display/state.h>
 #include <kernel/state.h>
+#include <platform/pad.h>
 #include <util/log.h>
+
+#include <algorithm>
 
 static int reserve_port(CtrlState &state) {
     for (int i = 0; i < SCE_CTRL_MAX_WIRELESS_NUM; i++) {
@@ -226,6 +229,58 @@ static void apply_controller(EmuEnvState &emuenv, uint32_t *buttons, float axes[
     axes[3] += axis_to_axis(SDL_GetGamepadAxis(controller, static_cast<SDL_GamepadAxis>(axis_binds[3])), analog_multiplier);
 }
 
+#ifdef __PROSPERO__
+// The console's own controller, which SDL has no driver for. Its buttons are laid out as the Vita's, bit for bit,
+// apart from the shoulders: a Vita game reads L and R, which the DualSense's L1 and R1 stand in for, and only a game
+// reading the extended pad tells the two pairs apart
+static void apply_console_pad(EmuEnvState &emuenv, uint32_t *buttons, float axes[4], bool ext) {
+    const platform::PadSample pad = platform::poll_pad();
+    if (!pad.connected)
+        return;
+
+    constexpr uint32_t SHARED = SCE_CTRL_L3 | SCE_CTRL_R3 | SCE_CTRL_START | SCE_CTRL_UP | SCE_CTRL_RIGHT
+        | SCE_CTRL_DOWN | SCE_CTRL_LEFT | SCE_CTRL_TRIANGLE | SCE_CTRL_CIRCLE | SCE_CTRL_CROSS | SCE_CTRL_SQUARE;
+    *buttons |= pad.buttons & SHARED;
+
+    // R2 is SELECT. The system keeps Create for itself and never passes it to a title, and the touchpad has to stay
+    // free because clicking it is how a tap on the Vita's screen is made, so R2 is what is left. The Vita itself has
+    // no second trigger, so only a game played as though on a PlayStation TV gives up anything by this
+    if (pad.buttons & platform::pad_buttons::R2)
+        *buttons |= SCE_CTRL_SELECT;
+
+    const bool l1 = pad.buttons & platform::pad_buttons::L1;
+    const bool r1 = pad.buttons & platform::pad_buttons::R1;
+    const bool l2 = pad.buttons & platform::pad_buttons::L2;
+    if (ext) {
+        *buttons |= (l1 ? SCE_CTRL_L1 : 0) | (r1 ? SCE_CTRL_R1 : 0) | (l2 ? SCE_CTRL_L2 : 0);
+    } else {
+        *buttons |= (l1 || l2 ? SCE_CTRL_L : 0) | (r1 ? SCE_CTRL_R : 0);
+    }
+
+    // Both sticks rest at 128 and run to either end of a byte, as the Vita's do. The same multiplier the other
+    // controllers get applies here: a stick that does not reach its own extremes leaves a game short of full tilt
+    const float multiplier = emuenv.cfg.controller_analog_multiplier;
+    const auto stick = [multiplier](uint8_t value) {
+        return std::clamp((value - 128.0f) / 127.0f * multiplier, -1.0f, 1.0f);
+    };
+    axes[0] += stick(pad.left_x);
+    axes[1] += stick(pad.left_y);
+    axes[2] += stick(pad.right_x);
+    axes[3] += stick(pad.right_y);
+
+    // What the sticks actually reach, so a game left walking instead of running can be told from a stick that
+    // never reports its own extremes
+    static uint8_t lowest = 255, highest = 0;
+    const uint8_t seen_low = std::min({ pad.left_x, pad.left_y, pad.right_x, pad.right_y });
+    const uint8_t seen_high = std::max({ pad.left_x, pad.left_y, pad.right_x, pad.right_y });
+    if (seen_low < lowest || seen_high > highest) {
+        lowest = std::min(lowest, seen_low);
+        highest = std::max(highest, seen_high);
+        LOG_INFO("Sticks have reached {} to {} (a byte's ends are 0 and 255)", lowest, highest);
+    }
+}
+#endif
+
 static void retrieve_ctrl_data(EmuEnvState &emuenv, int port, bool is_v2, bool negative, bool from_ext_function, SceUInt32 &buttons, SceUInt8 &lx, SceUInt8 &ly, SceUInt8 &rx, SceUInt8 &ry) {
     std::lock_guard<std::mutex> guard(emuenv.ctrl.mutex);
 
@@ -277,6 +332,11 @@ static void retrieve_ctrl_data(EmuEnvState &emuenv, int port, bool is_v2, bool n
             apply_controller(emuenv, &buttons, axes.data(), controller.controller.get(), is_v2);
         }
     }
+
+#ifdef __PROSPERO__
+    if (port == 1)
+        apply_console_pad(emuenv, &buttons, axes.data(), is_v2);
+#endif
 
     reset_axes();
 }

@@ -9,6 +9,9 @@ endif()
 
 project(Vita3K)
 
+# Set by cmake/ps5-payload.cmake, the toolchain for the PS5 payload SDK
+option(VITA3K_PS5_PORT "Build Vita3K for the PS5" OFF)
+
 # Detects the amount of processors of the host machine and forwards the result to CPU_COUNT
 include(ProcessorCount)
 ProcessorCount(CPU_COUNT)
@@ -45,7 +48,7 @@ if(ANDROID)
 		set(CMAKE_VISIBILITY_INLINES_HIDDEN 1)
 	endif()
 else()
-	if((ARCHITECTURE STREQUAL "x86_64") OR APPLE)
+	if(((ARCHITECTURE STREQUAL "x86_64") OR APPLE) AND NOT VITA3K_PS5_PORT)
 		option(USE_DISCORD_RICH_PRESENCE "Build Vita3K with Discord Rich Presence" ON)
 	endif()
 	option(BUILD_APPIMAGE "Build an AppImage." OFF)
@@ -123,9 +126,13 @@ macro(b2_build)
 			OUTPUT_QUIET
 		)
 	elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+		set(BOOST_BOOTSTRAP_TOOLSET ${BOOST_TOOLSET})
+		if(VITA3K_PS5_PORT)
+			set(BOOST_BOOTSTRAP_TOOLSET "gcc")
+		endif()
 		execute_process(
 			COMMAND chmod +x ${BOOST_SOURCEDIR}/tools/build/src/engine/build.sh
-			COMMAND sh ${BOOST_SOURCEDIR}/bootstrap.sh --with-toolset=${BOOST_TOOLSET}
+			COMMAND sh ${BOOST_SOURCEDIR}/bootstrap.sh --with-toolset=${BOOST_BOOTSTRAP_TOOLSET}
 			WORKING_DIRECTORY ${BOOST_SOURCEDIR}
 			OUTPUT_QUIET
 		)
@@ -135,7 +142,17 @@ endmacro(b2_build)
 # Macro to compile Boost
 macro(boost_compile)
 	list(TRANSFORM BOOST_MODULES_TO_FIND PREPEND --with- OUTPUT_VARIABLE b2_cmd_line_common)
+	set(BOOST_B2_TOOLSET ${BOOST_TOOLSET})
+	set(BOOST_B2_USER_CONFIG)
+	if(VITA3K_PS5_PORT)
+		set(BOOST_B2_TOOLSET "clang-ps5")
+		set(BOOST_B2_USER_CONFIG "${CMAKE_BINARY_DIR}/boost-ps5-config.jam")
+		file(WRITE "${BOOST_B2_USER_CONFIG}" "using clang : ps5 : ${CMAKE_CXX_COMPILER} ;\n")
+	endif()
 	set(b2_cmd_line_common ${b2} ${b2_cmd_line_common} -j${CPU_COUNT} --build-dir=${BOOST_INSTALLDIR} --stagedir=${BOOST_INSTALLDIR} cxxflags=${BOOST_CXX_FLAGS})
+	if(BOOST_B2_USER_CONFIG)
+		list(APPEND b2_cmd_line_common --user-config=${BOOST_B2_USER_CONFIG})
+	endif()
 	set(Boost_USE_DEBUG_RUNTIME "")
 	if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
 		execute_process(
@@ -152,6 +169,12 @@ macro(boost_compile)
 	elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		execute_process(
 			COMMAND ${b2_cmd_line_common} --ignore-site-config toolset=${BOOST_TOOLSET} stage
+			WORKING_DIRECTORY ${BOOST_SOURCEDIR}
+			OUTPUT_QUIET
+		)
+	elseif(VITA3K_PS5_PORT)
+		execute_process(
+			COMMAND ${b2_cmd_line_common} --ignore-site-config toolset=${BOOST_B2_TOOLSET} target-os=freebsd stage
 			WORKING_DIRECTORY ${BOOST_SOURCEDIR}
 			OUTPUT_QUIET
 		)
@@ -172,8 +195,8 @@ macro(get_boost)
 
 		set(Boost_NO_WARN_NEW_VERSIONS 1)
 
-		# First, try to find Boost without any hints (system Boost)
-		if(NOT VITA3K_FORCE_CUSTOM_BOOST)
+		# First, try to find Boost without any hints (system Boost). The PS5 SDK has none
+		if(NOT VITA3K_FORCE_CUSTOM_BOOST AND NOT VITA3K_PS5_PORT)
 			find_package(Boost 1.81 COMPONENTS ${BOOST_MODULES_TO_FIND} QUIET)
 		endif()
 
@@ -187,6 +210,14 @@ macro(get_boost)
 			set(BOOST_ROOT "${BOOST_SOURCEDIR}")                            # find_package(Boost ...) hint
 			set(BOOST_INCLUDEDIR "${BOOST_SOURCEDIR}")                      # find_package(Boost ...) hint
 			set(BOOST_LIBRARYDIR "${BOOST_INSTALLDIR}/lib")                 # find_package(Boost ...) hint
+
+			# A cross toolchain (the PS5 SDK) only searches its sysroot for packages, which would re-root the
+			# build tree's Boost and its per-component configs. The custom Boost lives in the build tree, so
+			# search it as-is while looking for it
+			set(BOOST_SAVED_FIND_ROOT_PATH_MODE_PACKAGE "${CMAKE_FIND_ROOT_PATH_MODE_PACKAGE}")
+			if(CMAKE_CROSSCOMPILING)
+				set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+			endif()
 
 			# Find Boost again to check for a existing compilation of the custom distribution
 			find_package(Boost 1.81 COMPONENTS ${BOOST_MODULES_TO_FIND} PATHS ${BOOST_INSTALLDIR} NO_DEFAULT_PATH)
@@ -254,6 +285,7 @@ macro(get_boost)
 			else()
 				message(STATUS "Custom Boost distribution found in ${BOOST_INSTALLDIR}")
 			endif()
+			set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE "${BOOST_SAVED_FIND_ROOT_PATH_MODE_PACKAGE}")
 		endif()
 	else()
 		# Try to find Boost on the system and CMake's default paths
@@ -293,4 +325,6 @@ endif()
 
 add_subdirectory(external)
 add_subdirectory(vita3k)
-add_subdirectory(tools/gen-modules)
+if(NOT VITA3K_PS5_PORT)
+	add_subdirectory(tools/gen-modules)
+endif()

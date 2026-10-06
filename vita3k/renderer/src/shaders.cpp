@@ -50,8 +50,14 @@ bool get_shaders_cache_hashs(State &renderer) {
     shaders_hashs.read((char *)&features_mask, sizeof(uint32_t));
     if (versionInFile != shader::CURRENT_VERSION || features_mask != renderer.get_features_mask()) {
         shaders_hashs.close();
-        fs::remove_all(renderer.shaders_path);
-        fs::remove_all(renderer.shaders_log_path);
+        // Clearing out the old entries is housekeeping, not a precondition: what is cached under the version that
+        // was just rejected is never read again, since the version is part of every entry's name. A sandbox that
+        // refuses the removal - a console's, say - must not take the emulator down over disk left behind
+        boost::system::error_code error;
+        fs::remove_all(renderer.shaders_path, error);
+        if (error)
+            LOG_WARN("The stale shader cache at {} could not be cleared: {}", renderer.shaders_path, error.message());
+        fs::remove_all(renderer.shaders_log_path, error);
         if (versionInFile != shader::CURRENT_VERSION)
             LOG_WARN("Current version of cache: {}, is outdated, recreate it.", versionInFile);
         else

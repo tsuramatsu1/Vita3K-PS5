@@ -18,6 +18,9 @@
 #include <audio/state.h>
 
 #include <audio/impl/cubeb_audio.h>
+#ifdef __PROSPERO__
+#include <audio/impl/ps5_audio.h>
+#endif
 #include <audio/impl/sdl_audio.h>
 
 #include <util/log.h>
@@ -68,6 +71,20 @@ void AudioState::set_backend(const std::string &adapter_name) {
     // first delete all ports then delete the backend
     out_ports.clear();
     adapter.reset();
+#ifdef __PROSPERO__
+    // Neither SDL nor cubeb has a driver for the console's audio hardware, so nothing else can be heard here. A
+    // configuration written before this backend existed, or on another machine, still names one of them
+    if (adapter_name != "PS5")
+        LOG_INFO("Audio backend {} cannot reach the console's hardware; using PS5", adapter_name);
+    adapter = std::make_unique<Ps5AudioAdapter>(*this);
+    this->audio_backend = "PS5";
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (!adapter->init())
+            adapter.reset();
+    }
+    return;
+#endif
     if (adapter_name == "SDL") {
         adapter = std::make_unique<SDLAudioAdapter>(*this);
     } else if (adapter_name == "Cubeb") {

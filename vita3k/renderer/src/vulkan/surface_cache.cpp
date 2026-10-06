@@ -224,6 +224,13 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
 
     overlap = (overlap && (ite->first + ite->second->total_bytes) > address);
 
+    // A small surface sitting just below this address shadows a larger one that does reach it, so when the nearest
+    // entry falls short the one before it is still worth asking
+    if (!overlap && ite != color_address_lookup.begin()) {
+        --ite;
+        overlap = (ite->first + ite->second->total_bytes) > address;
+    }
+
     const SceGxmColorBaseFormat base_format = gxm::get_base_format(color->colorFormat);
     vk::Format vk_format = color::translate_format(base_format);
 
@@ -394,37 +401,6 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
     const uint32_t width = static_cast<uint32_t>(original_width * state.res_multiplier);
     const uint32_t height = static_cast<uint32_t>(original_height * state.res_multiplier);
 
-    bool overlap = true;
-    // Of course, this works under the assumption that range must be unique :D
-    auto ite = color_address_lookup.upper_bound(address);
-    if (ite == color_address_lookup.begin())
-        // no match
-        overlap = false;
-    else
-        --ite;
-    // ite is now the first item with an address lower or equal to key
-
-    overlap = (overlap && (ite->first + ite->second->total_bytes) > address);
-
-    if (!overlap)
-        return std::nullopt;
-
-    if (*ite->second->dirty)
-        // Guest wrote to the surface backing memory since it was rendered, so GPU data is stale.
-        return std::nullopt;
-
-    const vk::ComponentMapping swizzle = texture::translate_swizzle(gxm::get_format(texture));
-    vk::Format vk_format = color::translate_format(base_format);
-
-    const bool is_srgb = texture.gamma_mode != 0;
-    if (is_srgb) {
-        if (vk_format == vk::Format::eR8G8B8A8Unorm) {
-            vk_format = vk::Format::eR8G8B8A8Srgb;
-        } else {
-            LOG_WARN_ONCE("Trying to use gamma correction with non-compatible format {}", vk::to_string(vk_format));
-        }
-    }
-
     uint32_t stride_bytes = 0;
     SurfaceTiling tiling = SurfaceTiling::Swizzled;
     if (texture.texture_type() == SCE_GXM_TEXTURE_LINEAR_STRIDED) {
@@ -453,16 +429,46 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
     }
     uint32_t total_surface_size = stride_bytes * original_height;
 
+    // More than one surface can cover an address, and only the one laid out the way this texture is read can be
+    // sampled from. Taking the nearest one below and rejecting it on a mismatch throws away a surface further back
+    // that would have matched, and what is sampled instead is another surface's bytes read at the wrong stride:
+    // the banding that produces looks like corruption rather than a cache miss
+    auto ite = color_address_lookup.upper_bound(address);
+    bool found = false;
+    while (ite != color_address_lookup.begin()) {
+        --ite;
+        if ((ite->first + ite->second->total_bytes) > address
+            && ite->second->tiling == tiling
+            && ite->second->stride_bytes == stride_bytes) {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found)
+        return std::nullopt;
+
+    if (*ite->second->dirty)
+        // Guest wrote to the surface backing memory since it was rendered, so GPU data is stale.
+        return std::nullopt;
+
+    const vk::ComponentMapping swizzle = texture::translate_swizzle(gxm::get_format(texture));
+    vk::Format vk_format = color::translate_format(base_format);
+
+    const bool is_srgb = texture.gamma_mode != 0;
+    if (is_srgb) {
+        if (vk_format == vk::Format::eR8G8B8A8Unorm) {
+            vk_format = vk::Format::eR8G8B8A8Srgb;
+        } else {
+            LOG_WARN_ONCE("Trying to use gamma correction with non-compatible format {}", vk::to_string(vk_format));
+        }
+    }
+
     ColorSurfaceCacheInfo &info = *ite->second;
 
     if ((base_format == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8 || info.format == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8)
         && base_format != info.format)
         // don't even try to match u8u8u8 with something else
-        return std::nullopt;
-
-    if (tiling != info.tiling || info.stride_bytes != stride_bytes)
-        // if the tiling is different, also don't try to match them
-        // about the strides, I've yet to see a case where the byte stride is different
         return std::nullopt;
 
     // Check if we can use this surface
@@ -574,8 +580,13 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
                 .cropped_height = height,
                 .format = base_format
             };
-            casted->texture.width = width;
-            casted->texture.height = height;
+            if (bytes_per_pixel_requested == bytes_per_pixel_in_store) {
+                casted->texture.width = original_width;
+                casted->texture.height = original_height;
+            } else {
+                casted->texture.width = width;
+                casted->texture.height = height;
+            }
             casted->texture.format = vk_format;
 
             // find the swizzle we need to apply
@@ -598,20 +609,23 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
         casted->scene_timestamp = scene_timestamp;
 
         if (bytes_per_pixel_requested == bytes_per_pixel_in_store) {
-            vk::ImageCopy image_copy{
+            // The region read has to be measured from where it starts, not from the surface's origin: a texture
+            // sited part-way into a surface would otherwise be asked for more than is left, which Vulkan does not
+            // define and a driver is free to answer with anything. A blit rather than a copy, so that what is left
+            // still fills the texture
+            const int32_t src_w = static_cast<int32_t>(std::min<uint32_t>(width, info.width - start_x));
+            const int32_t src_h = static_cast<int32_t>(std::min<uint32_t>(height, info.height - start_sourced_line));
+
+            vk::ImageBlit blit{
                 .srcSubresource = vkutil::color_subresource_layer,
-                .srcOffset = { static_cast<int32_t>(start_x), static_cast<int32_t>(start_sourced_line), 0 },
+                .srcOffsets = std::array<vk::Offset3D, 2>{
+                    vk::Offset3D{ static_cast<int32_t>(start_x), static_cast<int32_t>(start_sourced_line), 0 },
+                    vk::Offset3D{ static_cast<int32_t>(start_x) + src_w, static_cast<int32_t>(start_sourced_line) + src_h, 1 } },
                 .dstSubresource = vkutil::color_subresource_layer,
-                .dstOffset = { 0,
-                    0,
-                    0 },
-                .extent = {
-                    // Don't try to copy what is in the stride
-                    std::min<uint32_t>(width, info.width),
-                    std::min<uint32_t>(height, info.height),
-                    1 }
+                .dstOffsets = std::array<vk::Offset3D, 2>{ vk::Offset3D{ 0, 0, 0 },
+                    vk::Offset3D{ static_cast<int32_t>(original_width), static_cast<int32_t>(original_height), 1 } }
             };
-            cmd_buffer.copyImage(info.texture.image, vk::ImageLayout::eGeneral, casted->texture.image, vk::ImageLayout::eTransferDstOptimal, image_copy);
+            cmd_buffer.blitImage(info.texture.image, vk::ImageLayout::eGeneral, casted->texture.image, vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
         } else {
             LOG_INFO_ONCE("Game is doing typeless copies");
             // We must use a transition buffer
@@ -646,7 +660,10 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
                 .setImageExtent({ width, height, 1 });
             cmd_buffer.copyBufferToImage(casted->transition_buffer.buffer, casted->texture.image, vk::ImageLayout::eTransferDstOptimal, copy_image_buffer);
         }
-        casted->texture.transition_to(cmd_buffer, vkutil::ImageLayout::ColorAttachmentReadWrite);
+        // This texture is about to be read by a shader and nothing else, so that is the layout it is left in.
+        // Leaving it as a colour attachment is a mismatch a lenient driver forgives and a strict one answers with
+        // whatever the image happens to hold
+        casted->texture.transition_to(cmd_buffer, vkutil::ImageLayout::SampledImage);
 
         return TextureLookupResult{
             casted->texture.view,

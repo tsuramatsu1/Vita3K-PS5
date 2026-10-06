@@ -28,6 +28,8 @@
 #include <spdlog/sinks/msvc_sink.h>
 #ifdef __ANDROID__
 #include <spdlog/sinks/android_sink.h>
+#elif defined(__PROSPERO__)
+#include <spdlog/sinks/stdout_sinks.h>
 #else
 #include <spdlog/sinks/stdout_color_sinks.h>
 #endif
@@ -51,7 +53,7 @@ static std::mutex s_log_callback_mutex;
 static void register_log_exception_handler();
 static void rebuild_default_logger();
 
-static void flush() {
+void flush() {
     spdlog::details::registry::instance().flush_all();
 }
 
@@ -88,6 +90,9 @@ ExitCode init(const Root &root_paths, bool use_stdout) {
     if (use_stdout)
 #ifdef __ANDROID__
         sinks.push_back(std::make_shared<spdlog::sinks::android_sink_mt>("Vita3K"));
+#elif defined(__PROSPERO__)
+        // Nothing reads a title's standard output on the console; the platform layer moves standard error into klog
+        sinks.push_back(std::make_shared<spdlog::sinks::stderr_sink_mt>());
 #else
         sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
 #endif
@@ -110,9 +115,13 @@ ExitCode init(const Root &root_paths, bool use_stdout) {
     SetConsoleTitle("Vita3K PSVita Emulator");
 #endif
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__)
     // needed, otherwise the log file contains nothing
     spdlog::flush_on(spdlog::level::trace);
+#elif defined(__PROSPERO__)
+    // Flushing every line costs the console a write to its log pipe each time, which an install writing thousands
+    // of files pays for in minutes. Warnings and worse still reach the file as they happen
+    spdlog::flush_on(spdlog::level::warn);
 #endif
 
     register_log_exception_handler();
@@ -143,6 +152,14 @@ void set_level(spdlog::level::level_enum log_level) {
 }
 
 ExitCode add_sink(const fs::path &log_path) {
+    // The log starts afresh each run, and on a console a game's run is usually followed by the launcher's own -
+    // which would wipe exactly the log worth reading. One run back is kept beside it
+    {
+        boost::system::error_code error;
+        if (fs::exists(log_path, error))
+            fs::rename(log_path, fs_utils::path_concat(log_path, ".previous"), error);
+    }
+
     try {
         sinks.push_back(std::make_shared<spdlog::sinks::basic_file_sink_mt>(log_path.generic_path().native(), true));
     } catch (const spdlog::spdlog_ex &ex) {

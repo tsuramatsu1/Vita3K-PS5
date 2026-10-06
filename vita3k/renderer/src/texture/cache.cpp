@@ -28,7 +28,8 @@
 #include <algorithm>
 #include <cstring>
 #include <numeric>
-#if defined(__x86_64__) && !defined(__APPLE__)
+// The PS5's CPU is fixed, so xxHash is built without runtime dispatch there
+#if defined(__x86_64__) && !defined(__APPLE__) && !defined(__PROSPERO__)
 #include <xxh_x86dispatch.h>
 #else
 #define XXH_INLINE_ALL

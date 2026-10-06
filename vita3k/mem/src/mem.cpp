@@ -36,6 +36,12 @@
 #include <unistd.h>
 #endif
 
+#ifdef __PROSPERO__
+#include "ps5_host_memory.h"
+// Asserts that ucontext_t has the console's layout, which places uc_mcontext later than FreeBSD's
+#include <ps5platform/context.h>
+#endif
+
 constexpr uint32_t STANDARD_PAGE_SIZE = KiB(4);
 constexpr size_t TOTAL_MEM_SIZE = GiB(4);
 constexpr bool LOG_PROTECT = false;
@@ -71,6 +77,16 @@ bool init(MemState &state, const bool use_page_table) {
     state.host_page_size = static_cast<int>(sysconf(_SC_PAGESIZE));
 #endif
 
+#ifdef __PROSPERO__
+    // The console reports the processor's 4 KiB page, but its kernel changes protection a 16 KiB block at a time.
+    // Protecting one page there also protects the three beside it, and a write to those arrives as a fault with
+    // nothing in the tree to explain it - which the renderer sees as writes it never gets told about
+    if (state.host_page_size < 16384) {
+        LOG_INFO("Protecting memory in 16 KiB blocks, not the {} bytes reported", state.host_page_size);
+        state.host_page_size = 16384;
+    }
+#endif
+
     assert(state.host_page_size >= 4096); // Limit imposed by Unicorn.
 
     void *preferred_address = reinterpret_cast<void *>(1ULL << 34);
@@ -86,6 +102,10 @@ bool init(MemState &state, const bool use_page_table) {
             return false;
         }
     }
+#elif defined(__PROSPERO__)
+    state.memory = Memory(mem::ps5::reserve(TOTAL_MEM_SIZE), delete_memory);
+    if (!state.memory)
+        return false;
 #else
     // http://man7.org/linux/man-pages/man2/mmap.2.html
     const int prot = PROT_NONE;
@@ -137,6 +157,8 @@ static void delete_memory(uint8_t *memory) {
 #ifdef _WIN32
         const BOOL ret = VirtualFree(memory, 0, MEM_RELEASE);
         assert(ret);
+#elif defined(__PROSPERO__)
+        mem::ps5::release(memory, TOTAL_MEM_SIZE);
 #else
         munmap(memory, TOTAL_MEM_SIZE);
 #endif
@@ -179,6 +201,11 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
 #ifdef _WIN32
     const void *const ret = VirtualAlloc(commit_ptr, commit_size, MEM_COMMIT, PAGE_READWRITE);
     LOG_CRITICAL_IF(!ret, "VirtualAlloc failed: {}", get_error_msg());
+#elif defined(__PROSPERO__)
+    if (!mem::ps5::commit(state.memory.get(), commit_start, commit_size)) {
+        state.allocator.free(page_num, page_count);
+        return 0;
+    }
 #else
     const int ret = mprotect(commit_ptr, commit_size, PROT_READ | PROT_WRITE);
     LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
@@ -221,9 +248,14 @@ Address alloc_aligned(MemState &state, uint32_t size, const char *name, unsigned
     return align_addr;
 }
 
+// A segment has to be recorded over the same range mprotect will actually act on, which is the host's page size and
+// not the Vita's. Where the two differ - 16 KiB pages on a console or an Apple Silicon Mac against the Vita's 4 KiB -
+// recording the narrower range lets two segments share a host page, and then a fault in one unprotects the other
+// behind its back: the second segment stays in the tree believing it is still watched, its callback never runs again,
+// and whatever it was guarding - a vertex buffer, a texture - is left stale on the GPU for good
 static void align_to_page(MemState &state, Address &addr, Address &size) {
-    const Address end = align(addr + size, STANDARD_PAGE_SIZE);
-    addr = align_down(addr, STANDARD_PAGE_SIZE);
+    const Address end = align(addr + size, state.host_page_size);
+    addr = align_down(addr, state.host_page_size);
     size = end - addr;
 }
 
@@ -523,8 +555,11 @@ void free(MemState &state, Address address) {
 #else
             int ret = mprotect(memory, batch_size, PROT_NONE);
             LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
+#ifndef __PROSPERO__
+            // The PS5's guest memory is direct memory, which stays backed until the range is released
             ret = madvise(memory, batch_size, MADV_DONTNEED);
             LOG_CRITICAL_IF(ret == -1, "madvise failed: {}", get_error_msg());
+#endif
 #endif
             batch_size = 0;
         }
@@ -539,8 +574,11 @@ void free(MemState &state, Address address) {
 #else
         int ret = mprotect(memory, batch_size, PROT_NONE);
         LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
+#ifndef __PROSPERO__
+        // The PS5's guest memory is direct memory, which stays backed until the range is released
         ret = madvise(memory, batch_size, MADV_DONTNEED);
         LOG_CRITICAL_IF(ret == -1, "madvise failed: {}", get_error_msg());
+#endif
 #endif
     }
 }
@@ -630,6 +668,8 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
 #else
 #ifdef __APPLE__
     const uint64_t err = context->uc_mcontext->__es.__err;
+#elif defined(__FreeBSD__)
+    const uint64_t err = context->uc_mcontext.mc_err;
 #else
     const uint64_t err = context->uc_mcontext.gregs[REG_ERR];
 #endif
@@ -657,9 +697,9 @@ static void register_access_violation_handler(const AccessViolationHandler &hand
     if (sigaction(SIGSEGV, &sa, NULL) == -1) {
         LOG_CRITICAL("Failed to register an exception handler");
     }
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__FreeBSD__)
     // When accessing memory region which is PROT_NONE on macOS, it is raising SIGBUS not SIGSEGV.
-    // So apply same signal handler to SIGBUS
+    // FreeBSD can do the same (machdep.prot_fault_translation). So apply same signal handler to SIGBUS
     if (sigaction(SIGBUS, &sa, NULL) == -1) {
         LOG_CRITICAL("Failed to register an exception handler to SIGBUS");
     }

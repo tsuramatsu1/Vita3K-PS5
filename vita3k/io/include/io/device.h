@@ -21,6 +21,7 @@
 
 #include <util/fs.h>
 
+#include <map>
 #include <string>
 
 namespace device {
@@ -75,5 +76,21 @@ std::string remove_duplicate_device(const std::string &path, VitaIoDevice &devic
  * \return A complete Boost.Filesystem path normalized.
  */
 fs::path construct_emulated_path(const VitaIoDevice dev, const fs::path &path, const fs::path &base_path, const bool redirect_pwd = false, const std::string &ext = "");
+
+/**
+ * \brief Places an app outside ux0:app: its ux0:app/<title_id> is then the host directory, as for an app kept on
+ * removable storage instead of installed. An app installed in ux0:app is not affected.
+ */
+void set_external_app(const fs::path &vita_fs_path, const std::string &title_id, const fs::path &host_directory);
+
+/**
+ * \brief The apps placed with set_external_app, title ID to host directory.
+ */
+std::map<std::string, fs::path> external_apps();
+
+/**
+ * \brief The host directory holding an app: vita_fs_path/ux0/app/<title_id>, or where it was placed.
+ */
+fs::path app_directory(const fs::path &vita_fs_path, const std::string &title_id);
 
 } // namespace device

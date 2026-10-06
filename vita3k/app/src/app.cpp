@@ -21,6 +21,7 @@
 #include <config/functions.h>
 #include <config/state.h>
 #include <emuenv/state.h>
+#include <io/device.h>
 #include <io/functions.h>
 #include <io/state.h>
 #include <packages/license.h>
@@ -275,7 +276,7 @@ void prepare_game_launch_overlay(EmuEnvState &emuenv) {
     renderer.precompile_requested = false;
     renderer.precompile_complete.store(false, std::memory_order_relaxed);
 
-    const auto bg_path = emuenv.vita_fs_path / "ux0/app" / emuenv.io.app_path / "sce_sys/pic0.png";
+    const auto bg_path = device::app_directory(emuenv.vita_fs_path, emuenv.io.app_path) / "sce_sys/pic0.png";
     if (fs::exists(bg_path))
         renderer.precompile_bg_path = fs_utils::path_to_utf8(bg_path);
 

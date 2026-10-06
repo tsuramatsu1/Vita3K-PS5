@@ -128,9 +128,13 @@ public:
             }
         }
 
-        m_iface_list.push_back(std::move(entry));
-        on_overlay_activated(m_iface_list.back());
-        return std::static_pointer_cast<T>(m_iface_list.back());
+        // Anything marked as staying on top keeps its place at the end, so a later arrival goes under it
+        const auto first_on_top = std::find_if(m_iface_list.begin(), m_iface_list.end(),
+            [](const auto &iface) { return iface && iface->always_on_top; });
+        const auto added = entry->always_on_top ? m_iface_list.insert(m_iface_list.end(), std::move(entry))
+                                                : m_iface_list.insert(first_on_top, std::move(entry));
+        on_overlay_activated(*added);
+        return std::static_pointer_cast<T>(*added);
     }
 
     // Allocates object and adds to internal list. Returns pointer to created object.

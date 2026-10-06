@@ -305,6 +305,17 @@ EXPORT(int, sceNetGetMacAddress, SceNetEtherAddr *addr, int flags) {
         RET_NET_ERRNO(SCE_NET_ERROR_EINVAL);
     else
         memcpy(addr->data, AdapterInfo[0].Address, 6);
+#elif defined(__PROSPERO__)
+    // FreeBSD has no SIOCGIFHWADDR, and the console's network adapters are not the title's to query
+    const uint8_t ps5_mac[6] = {
+        0x02, // LAA
+        'P',
+        'S',
+        '5',
+        0x00,
+        0x01,
+    };
+    memcpy(addr->data, ps5_mac, 6);
 #elif defined(__unix__)
     struct ifreq ifr;
     struct ifconf ifc;
@@ -555,8 +566,17 @@ EXPORT(int, sceNetResolverGetError) {
 
 EXPORT(int, sceNetResolverStartAton, int rid, const SceNetInAddr *addr, char *hostname, int len, int timeout, int retry, int flags) {
     TRACY_FUNC(sceNetResolverStartAton, rid, addr, hostname, len, timeout, retry, flags);
+#ifdef __PROSPERO__
+    // The console exports getnameinfo but not gethostbyaddr
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    memcpy(&address.sin_addr, addr, sizeof(address.sin_addr));
+    if (getnameinfo(reinterpret_cast<const sockaddr *>(&address), sizeof(address), hostname, len, nullptr, 0, NI_NAMEREQD) != 0)
+        return RET_ERROR(SCE_NET_ERROR_RESOLVER_ENOHOST);
+#else
     struct hostent *resolved = gethostbyaddr((const char *)addr, len, AF_INET);
     strcpy(hostname, resolved->h_name);
+#endif
     return 0;
 }
 

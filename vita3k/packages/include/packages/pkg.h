@@ -81,6 +81,10 @@ struct PkgEntry {
     uint32_t padding;
 };
 
-bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_zRIF, const std::function<void(float)> &progress_callback = nullptr);
+// item_callback, when given, is told each file as it is written and how much of that file is done. cancelled, when
+// given, is asked as the data is unpacked whether to stop, and what was written is then removed
+bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_zRIF, const std::function<void(float)> &progress_callback = nullptr, const std::function<void(const std::string &, float)> &item_callback = nullptr, const std::function<bool()> &cancelled = nullptr);
+// Logs how fast AES runs here, which is what a package install spends its time on
+void report_crypto_speed();
 std::string find_pkg_zrif(const fs::path &pkg_path, const fs::path &vita_fs_path);
 bool decrypt_install_nonpdrm(EmuEnvState &emuenv, const fs::path &drmlicpath, const fs::path &title_path, const std::function<void(float)> &progress_callback = nullptr);

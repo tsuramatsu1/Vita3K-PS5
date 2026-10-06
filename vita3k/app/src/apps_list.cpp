@@ -19,6 +19,7 @@
 #include <app/state.h>
 #include <config/state.h>
 #include <emuenv/state.h>
+#include <io/device.h>
 #include <io/state.h>
 #include <packages/sfo.h>
 #include <util/fs.h>
@@ -80,6 +81,14 @@ static std::vector<AppCacheSource> collect_app_cache_sources(const EmuEnvState &
             .title_id = title_id,
             .param_sfo_write_time = get_path_write_time(entry.path() / "sce_sys/param.sfo"),
             .icon_write_time = get_path_write_time(entry.path() / "sce_sys/icon0.png"),
+        });
+    }
+    // Apps kept outside ux0:app, on removable storage
+    for (const auto &[title_id, directory] : device::external_apps()) {
+        sources.push_back({
+            .title_id = title_id,
+            .param_sfo_write_time = get_path_write_time(directory / "sce_sys/param.sfo"),
+            .icon_write_time = get_path_write_time(directory / "sce_sys/icon0.png"),
         });
     }
 
@@ -208,8 +217,8 @@ static std::string resolve_existing_path(const EmuEnvState &emuenv, const fs::pa
 }
 
 static std::string get_icon_path(const EmuEnvState &emuenv, const std::string &title_id) {
-    const auto rel = fs::path("ux0/app") / title_id / "sce_sys/icon0.png";
-    if (const auto resolved = resolve_existing_path(emuenv, rel); !resolved.empty())
+    const auto icon = device::app_directory(emuenv.vita_fs_path, title_id) / "sce_sys/icon0.png";
+    if (const auto resolved = resolve_existing_path(emuenv, icon); !resolved.empty())
         return resolved;
 
     const auto default_rel = fs::path("vs0/data/internal/common/default-icon.png");

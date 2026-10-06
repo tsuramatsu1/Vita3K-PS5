@@ -29,6 +29,7 @@ add_library(
 	src/display_manager.cpp
 	src/shader_compile_notice.cpp
 	src/perf_overlay.cpp
+	src/pointer.cpp
 	src/trophy_notification.cpp
 	src/common_dialog.cpp
 	src/shader_precompile_progress.cpp

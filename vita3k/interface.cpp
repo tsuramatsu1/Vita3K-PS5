@@ -27,6 +27,7 @@
 #include <display/functions.h>
 #include <display/state.h>
 #include <emuenv/state.h>
+#include <io/device.h>
 #include <io/functions.h>
 #include <io/vfs.h>
 #include <kernel/state.h>
@@ -92,13 +93,13 @@ static std::string fallback_theme_root_name(const std::string &content_path) {
     return (separator == std::string::npos) ? trimmed : trimmed.substr(separator + 1);
 }
 
-static bool is_nonpdrm(EmuEnvState &emuenv, const fs::path &output_path) {
+static bool is_nonpdrm(EmuEnvState &emuenv, const fs::path &output_path, const std::function<void(float)> &progress_callback = nullptr) {
     const auto app_license_path{ emuenv.vita_fs_path / "ux0/license" / emuenv.app_info.app_title_id / fmt::format("{}.rif", emuenv.app_info.app_content_id) };
     const auto is_patch_found_app_license = (emuenv.app_info.app_category == "gp") && fs::exists(app_license_path);
     if (fs::exists(output_path / "sce_sys/package/work.bin") || is_patch_found_app_license) {
         fs::path licpath = is_patch_found_app_license ? app_license_path : output_path / "sce_sys/package/work.bin";
         LOG_INFO("Decrypt layer: {}", output_path);
-        if (!decrypt_install_nonpdrm(emuenv, licpath, output_path)) {
+        if (!decrypt_install_nonpdrm(emuenv, licpath, output_path, progress_callback)) {
             LOG_ERROR("NoNpDrm installation failed, deleting data!");
             fs::remove_all(output_path);
             return false;
@@ -165,7 +166,45 @@ static void set_theme_name(EmuEnvState &emuenv, const vfs::FileBuffer &buffer, c
     }
 }
 
-static bool install_archive_content(EmuEnvState &emuenv, const ZipPtr &zip, const std::string &content_path, const std::function<void(ArchiveContents)> &progress_callback, const ReinstallCallback &reinstall_callback) {
+// Writes one file out of the archive, telling the caller how far through it is. Extracting straight to a path
+// hands miniz the whole file at once, which leaves a large one looking stalled for as long as it takes
+struct ExtractedFile {
+    // miniz hands over its own small pieces, and small writes cost far more than large ones on some consoles, so
+    // they are gathered here and handed to the filesystem in one go
+    static constexpr std::size_t BLOCK = 2u << 20;
+
+    FILE *out = nullptr;
+    std::uint64_t written = 0;
+    std::uint64_t total = 0;
+    const std::function<void(float)> *report = nullptr;
+    std::vector<std::uint8_t> pending;
+
+    bool flush() {
+        if (pending.empty())
+            return true;
+        const bool ok = fwrite(pending.data(), 1, pending.size(), out) == pending.size();
+        pending.clear();
+        return ok;
+    }
+
+    bool push(const void *data, std::size_t size) {
+        const auto *bytes = static_cast<const std::uint8_t *>(data);
+        pending.insert(pending.end(), bytes, bytes + size);
+        written += size;
+        if (report && total > 0)
+            (*report)(static_cast<float>(written) / static_cast<float>(total));
+        return pending.size() < BLOCK || flush();
+    }
+};
+
+static size_t write_extracted_file(void *opaque, mz_uint64, const void *data, size_t size) {
+    auto *file = static_cast<ExtractedFile *>(opaque);
+    if (!file->push(data, size))
+        return 0;
+    return size;
+}
+
+static bool install_archive_content(EmuEnvState &emuenv, const ZipPtr &zip, const std::string &content_path, const fs::path &vita_fs_path, const std::function<void(ArchiveContents)> &progress_callback, const ReinstallCallback &reinstall_callback) {
     std::string sfo_path = "sce_sys/param.sfo";
     std::string theme_path = "theme.xml";
     vfs::FileBuffer buffer, theme;
@@ -173,7 +212,7 @@ static bool install_archive_content(EmuEnvState &emuenv, const ZipPtr &zip, cons
     const auto is_theme = mz_zip_reader_extract_file_to_callback(zip.get(), (content_path + theme_path).c_str(), &write_to_buffer, &theme, 0);
     const std::string theme_root_name = fallback_theme_root_name(content_path);
 
-    auto output_path{ emuenv.vita_fs_path / "ux0" };
+    auto output_path{ vita_fs_path / "ux0" };
     if (mz_zip_reader_extract_file_to_callback(zip.get(), (content_path + sfo_path).c_str(), &write_to_buffer, &buffer, 0)) {
         sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang);
         if (!set_content_path(emuenv, is_theme, output_path))
@@ -200,9 +239,10 @@ static bool install_archive_content(EmuEnvState &emuenv, const ZipPtr &zip, cons
     float file_progress = 0;
     float decrypt_progress = 0;
 
-    const auto update_progress = [&]() {
+    const auto update_progress = [&](std::optional<std::string> item = {}, std::optional<float> item_progress = {}) {
         if (progress_callback)
-            progress_callback({ {}, {}, { file_progress * 0.7f + decrypt_progress * 0.3f } });
+            progress_callback(
+                { {}, {}, { file_progress * 0.7f + decrypt_progress * 0.3f }, std::move(item), item_progress });
     };
 
     mz_uint num_files = mz_zip_reader_get_num_files(zip.get());
@@ -223,14 +263,29 @@ static bool install_archive_content(EmuEnvState &emuenv, const ZipPtr &zip, cons
             } else {
                 fs::create_directories(file_output.parent_path());
                 LOG_INFO("Extracting {}", file_output);
-                mz_zip_reader_extract_to_file(zip.get(), i, fs_utils::path_to_utf8(file_output).c_str(), 0);
+                update_progress(replace_filename, 0.f);
+                const std::function<void(float)> report = [&](float done) { update_progress(replace_filename, done); };
+                ExtractedFile writing{ FOPEN(file_output.c_str(), "wb"), 0, file_stat.m_uncomp_size, &report, {} };
+                if (writing.out) {
+                    writing.pending.reserve(ExtractedFile::BLOCK);
+                    mz_zip_reader_extract_to_callback(zip.get(), i, write_extracted_file, &writing, 0);
+                    writing.flush();
+                    fclose(writing.out);
+                } else {
+                    LOG_ERROR("Could not write {}", file_output);
+                }
             }
         }
     }
 
     if (fs::exists(output_path / "sce_sys/package/") && emuenv.app_info.app_title_id.starts_with("PCS")) {
-        update_progress();
-        if (is_nonpdrm(emuenv, output_path))
+        update_progress(std::string{ "Decrypting" }, 0.f);
+        // The decryption reports how far through the data it is, which is most of the time a package takes
+        if (is_nonpdrm(emuenv, output_path, [&](float fraction) {
+                const float done = std::clamp(fraction, 0.f, 1.f);
+                decrypt_progress = done * 100.f;
+                update_progress(std::string{ "Decrypting" }, done);
+            }))
             decrypt_progress = 100.f;
         else
             return false;
@@ -277,7 +332,9 @@ static std::vector<std::string> get_archive_contents_path(const ZipPtr &zip) {
     return content_path;
 }
 
-std::vector<ContentInfo> install_archive(EmuEnvState &emuenv, const fs::path &archive_path, const std::function<void(ArchiveContents)> &progress_callback, const ReinstallCallback &reinstall_callback) {
+std::vector<ContentInfo> install_archive(EmuEnvState &emuenv, const fs::path &archive_path, const std::function<void(ArchiveContents)> &progress_callback, const ReinstallCallback &reinstall_callback, const fs::path &destination) {
+    // Where the content lands: the emulated file system, or another root the caller chose, such as a USB drive
+    const fs::path &vita_fs_path = destination.empty() ? emuenv.vita_fs_path : destination;
     if (string_utils::tolower(archive_path.extension().string()) == ".vci") {
         const auto vci_progress = [&](float pct) {
             if (progress_callback)
@@ -322,7 +379,7 @@ std::vector<ContentInfo> install_archive(EmuEnvState &emuenv, const fs::path &ar
     for (auto &path : content_path) {
         current++;
         update_progress();
-        bool state = install_archive_content(emuenv, zip, path, progress_callback, reinstall_callback);
+        bool state = install_archive_content(emuenv, zip, path, vita_fs_path, progress_callback, reinstall_callback);
         // Can't use emplace_back due to Clang 15 for macos
         content_installed.push_back({ emuenv.app_info.app_title, emuenv.app_info.app_title_id, emuenv.app_info.app_category, emuenv.app_info.app_content_id, path, state });
     }
@@ -509,7 +566,7 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
             process_preload_disabled = *preload_disabled_ptr.get(emuenv.mem);
         }
     }
-    const auto module_app_path{ emuenv.vita_fs_path / "ux0/app" / emuenv.io.app_path / "sce_module" };
+    const auto module_app_path{ device::app_directory(emuenv.vita_fs_path, emuenv.io.app_path) / "sce_module" };
 
     std::vector<std::string> lib_load_list = {};
     // todo: check if module is imported
@@ -621,7 +678,7 @@ ExitCode load_app(int32_t &main_module_id, EmuEnvState &emuenv) {
 
 ExitCode load_app(int32_t &main_module_id, EmuEnvState &emuenv, const AppLaunchRequest &launch_request) {
     if (load_app_impl(main_module_id, emuenv, launch_request) != Success) {
-        std::string message = fmt::format(fmt::runtime(lang::get(lang::str::load_app_failed_msg)), emuenv.vita_fs_path / "ux0/app" / emuenv.io.app_path / emuenv.self_path);
+        std::string message = fmt::format(fmt::runtime(lang::get(lang::str::load_app_failed_msg)), device::app_directory(emuenv.vita_fs_path, emuenv.io.app_path) / emuenv.self_path);
         LOG_ERROR(message);
         return ModuleLoadFailed;
     }

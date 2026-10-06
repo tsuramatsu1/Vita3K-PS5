@@ -62,7 +62,12 @@ struct Config {
         bool cpu_opt = true;
         int modules_mode = ModulesMode::AUTOMATIC;
         std::vector<std::string> lle_modules = {};
+#ifdef __PROSPERO__
+        // SDL has no driver for the console's audio hardware
+        std::string audio_backend = "PS5";
+#else
         std::string audio_backend = "SDL";
+#endif
         int audio_volume = 100;
         bool ngs_enable = true;
         bool pstv_mode = false;

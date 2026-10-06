@@ -48,12 +48,17 @@ struct AndroidDisplayHandle {
     SDL_Window *window = nullptr;
 };
 
+// The PS5 has no windows: frames go to VideoOut, the one display the Vulkan driver exposes through VK_KHR_display
+struct Ps5DisplayHandle {
+};
+
 using DisplayHandle = std::variant<std::monostate,
     Win32DisplayHandle,
     MacOSDisplayHandle,
     X11DisplayHandle,
     WaylandDisplayHandle,
-    AndroidDisplayHandle>;
+    AndroidDisplayHandle,
+    Ps5DisplayHandle>;
 
 class FrameHost {
 public:

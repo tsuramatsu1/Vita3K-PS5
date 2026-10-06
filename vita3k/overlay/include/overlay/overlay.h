@@ -81,6 +81,9 @@ struct overlay {
     bool use_window_space = false;
 
     std::atomic<bool> visible{ false };
+
+    // Drawn after everything else. A pointer belongs above whatever it is pointing at, however late that arrives
+    bool always_on_top = false;
     mutable std::atomic<bool> needs_redraw{ false };
 
     // Minimum interval between flip requests

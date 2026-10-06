@@ -17,6 +17,8 @@
 
 #include <app/functions.h>
 
+#include <platform/pad.h>
+
 #include <audio/state.h>
 #include <camera/state.h>
 #include <compat/state.h>
@@ -47,6 +49,7 @@
 #include <overlay/input.h>
 #include <overlay/trophy_notification.h>
 #include <packages/sfo.h>
+#include <platform/platform.h>
 #include <regmgr/state.h>
 #include <renderer/functions.h>
 #include <renderer/state.h>
@@ -122,6 +125,34 @@ static overlay::button_states poll_overlay_input(EmuEnvState &emuenv) {
             axes[3] += sdl_axis_to_float(SDL_GetGamepadAxis(gp, static_cast<SDL_GamepadAxis>(axis_binds[3])), mult);
         }
     }
+
+#ifdef __PROSPERO__
+    // The console's own controller, which SDL does not see. Without this the overlay's dialogs - the save data
+    // picker among them - take no input at all, since neither a keyboard nor an SDL gamepad exists here
+    {
+        const platform::PadSample pad = platform::current_pad();
+        constexpr uint32_t SHARED = SCE_CTRL_L3 | SCE_CTRL_R3 | SCE_CTRL_START | SCE_CTRL_UP | SCE_CTRL_RIGHT
+            | SCE_CTRL_DOWN | SCE_CTRL_LEFT | SCE_CTRL_TRIANGLE | SCE_CTRL_CIRCLE | SCE_CTRL_CROSS | SCE_CTRL_SQUARE;
+        buttons |= pad.buttons & SHARED;
+        if (pad.buttons & platform::pad_buttons::L1)
+            buttons |= SCE_CTRL_L1;
+        if (pad.buttons & platform::pad_buttons::R1)
+            buttons |= SCE_CTRL_R1;
+        if (pad.buttons & platform::pad_buttons::L2)
+            buttons |= SCE_CTRL_L2;
+        if (pad.buttons & platform::pad_buttons::R2)
+            buttons |= SCE_CTRL_R2;
+
+        const float multiplier = emuenv.cfg.controller_analog_multiplier;
+        const auto stick = [multiplier](uint8_t value) {
+            return std::clamp((value - 128.0f) / 127.0f * multiplier, -1.0f, 1.0f);
+        };
+        axes[0] += stick(pad.left_x);
+        axes[1] += stick(pad.left_y);
+        axes[2] += stick(pad.right_x);
+        axes[3] += stick(pad.right_y);
+    }
+#endif
 
     auto set = [&](uint32_t mask, overlay::pad_button btn) {
         if (buttons & mask)
@@ -241,8 +272,22 @@ void set_current_config(EmuEnvState &emuenv, const std::string &app_path) {
 }
 
 // Initializes paths to their respective defaults, to be changed later by settings or CLI
+// A runtime without a desktop UI (the PS5) supplies its own directories instead
 // Returns true if in portable mode, false otherwise
-bool init_paths(Root &root_paths) {
+bool init_paths(Root &root_paths, const platform::RuntimeConfig *runtime_cfg) {
+    if (runtime_cfg) {
+        const fs::path save_root = fs::path(runtime_cfg->save_directory) / "";
+
+        root_paths.set_static_assets_path(fs::path(runtime_cfg->static_assets_directory) / "");
+        root_paths.set_vita_fs_path(save_root / "vita" / "");
+        root_paths.set_log_path(save_root / "logs" / "");
+        root_paths.set_config_path(save_root / "config" / "");
+        root_paths.set_shared_path(save_root / "shared" / "");
+        root_paths.set_cache_path(save_root / "cache" / "");
+        root_paths.set_patch_path(save_root / "patch" / "");
+        return false;
+    }
+
     bool portable = false;
 #ifdef __ANDROID__
     fs::path internal_storage_path = fs::path(SDL_GetAndroidExternalStoragePath()) / "";
@@ -269,7 +314,7 @@ bool init_paths(Root &root_paths) {
     // On Apple platforms, exe_path is "Contents/Resources/" inside the app bundle.
     // An extra parent_path is apparently needed because of the trailing slash.
     auto portable_path = exe_path.parent_path().parent_path().parent_path().parent_path() / "portable" / "";
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__FreeBSD__)
     fs::path portable_path = "";
     auto APPIMAGE = getenv("APPIMAGE"); // Used in AppImage
     if (APPIMAGE) {

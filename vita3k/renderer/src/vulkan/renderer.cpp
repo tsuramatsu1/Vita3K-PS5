@@ -150,6 +150,11 @@ const static std::vector<const char *> required_device_extensions = {
     vk::KHRMaintenance1ExtensionName
 };
 
+#ifdef __PROSPERO__
+// The PS5 has no Vulkan loader: the driver (RADV) is linked into the executable and exports its ICD entry point
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
+#endif
+
 namespace renderer::vulkan {
 
 #if defined(__ANDROID__) && defined(USE_ADRENO_TOOLS)
@@ -378,6 +383,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
 
         if (!detect_patch_bcn(&texture_cache.support_dxt))
             return false;
+#elif defined(__PROSPERO__)
+        VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_icdGetInstanceProcAddr);
 #else
         VULKAN_HPP_DEFAULT_DISPATCHER.init();
 #endif
@@ -399,6 +406,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         instance_extensions.push_back(vk::EXTMetalSurfaceExtensionName);
 #elif defined(__ANDROID__)
         instance_extensions.push_back(vk::KHRAndroidSurfaceExtensionName);
+#elif defined(__PROSPERO__)
+        instance_extensions.push_back(vk::KHRDisplayExtensionName);
 #else
         auto *frame_host = this->renderer::State::frame;
         if (!select_linux_surface_extension(*this, frame_host->handle(), instance_extensions))
@@ -1487,6 +1496,14 @@ bool VKState::map_memory(MemState &mem, Ptr<void> address, uint32_t size) {
         vkutil::Buffer buffer(size + KiB(4));
         buffer.init_buffer(mapped_memory_flags, vkutil::vma_mapped_alloc);
 
+        // Everything a game's memory holds reaches the GPU through these, written with a plain memcpy and never
+        // flushed. That is only sound on coherent memory, which the allocation asks for but does not insist on,
+        // so what was actually handed over is worth saying out loud rather than assuming
+        const vk::MemoryPropertyFlags properties = allocator.getAllocationMemoryProperties(buffer.allocation);
+        LOG_INFO_ONCE("Mapped game memory is {}, {}", vk::to_string(properties),
+            (properties & vk::MemoryPropertyFlagBits::eHostCoherent) ? "which the GPU sees without flushing"
+                                                                     : "which needs flushing the GPU does not get");
+
         vk::BufferDeviceAddressInfoKHR address_info{
             .buffer = buffer.buffer
         };
@@ -1685,6 +1702,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string 
             return info;
 
         dispatch.init(vk_get_instance_proc_addr);
+#elif defined(__PROSPERO__)
+        dispatch.init(vk_icdGetInstanceProcAddr);
 #else
         dispatch.init();
 #endif

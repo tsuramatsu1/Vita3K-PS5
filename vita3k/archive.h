@@ -32,6 +32,9 @@ struct ArchiveContents {
     std::optional<float> count;
     std::optional<float> current;
     std::optional<float> progress;
+    // The file being written now, and how far through that one file we are, for a caller that shows what is going on
+    std::optional<std::string> item;
+    std::optional<float> item_progress;
 };
 
 struct ContentInfo {
@@ -43,5 +46,6 @@ struct ContentInfo {
     bool state = false;
 };
 
-std::vector<ContentInfo> install_archive(EmuEnvState &emuenv, const fs::path &archive_path, const std::function<void(ArchiveContents)> &progress_callback = nullptr, const ReinstallCallback &reinstall_callback = nullptr);
+// destination, when given, is the root to install into in place of emuenv.vita_fs_path: a USB drive, say
+std::vector<ContentInfo> install_archive(EmuEnvState &emuenv, const fs::path &archive_path, const std::function<void(ArchiveContents)> &progress_callback = nullptr, const ReinstallCallback &reinstall_callback = nullptr, const fs::path &destination = {});
 uint32_t install_contents(EmuEnvState &emuenv, const fs::path &path);

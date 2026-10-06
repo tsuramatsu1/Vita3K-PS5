@@ -348,6 +348,11 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
     config.processor_id = core_id;
     config.optimizations = cpu_opt ? Dynarmic::all_safe_optimizations : Dynarmic::no_optimizations;
     config.enable_cycle_counting = false;
+#ifdef __PROSPERO__
+    // Every guest thread has its own JIT. On the PS5 each code cache is committed direct memory that must lie within
+    // 2 GiB of the emulator's code, so the default 128 MiB caches run out of room after about a dozen threads
+    config.code_cache_size = 16 * 1024 * 1024;
+#endif
 
     return std::make_unique<Dynarmic::A32::Jit>(config);
 }

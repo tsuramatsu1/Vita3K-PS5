@@ -888,14 +888,20 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     spv::Id pred_arr_type = b.makeArrayType(b_type, b.makeIntConstant(REG_PRED_COUNT / 4), 0);
     spv::Id o_arr_type = b.makeArrayType(f32_v4_type, b.makeIntConstant(REG_O_COUNT / 4), 0);
 
-    // Create register banks
-    spv_params.ins = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, pa_arr_type, "pa");
-    spv_params.uniforms = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, sa_arr_type, "sa");
-    spv_params.internals = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, i_arr_type, "internals");
-    spv_params.temps = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, temp_arr_type, "r");
-    spv_params.predicates = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, pred_arr_type, "p");
-    spv_params.indexes = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, index_arr_type, "idx");
-    spv_params.outs = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, o_arr_type, "outs");
+    // Create register banks. A shader is free to read a register the program never wrote, which on the Vita reads
+    // whatever the bank happened to hold; left undefined here, a driver may hand back the last shader's register
+    // file instead, and the speckles and bands that produces are not reproducible from the program alone
+    const auto register_bank = [&b](spv::Id arr_type, const char *name) {
+        return b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, arr_type, name, b.makeNullConstant(arr_type));
+    };
+
+    spv_params.ins = register_bank(pa_arr_type, "pa");
+    spv_params.uniforms = register_bank(sa_arr_type, "sa");
+    spv_params.internals = register_bank(i_arr_type, "internals");
+    spv_params.temps = register_bank(temp_arr_type, "r");
+    spv_params.predicates = register_bank(pred_arr_type, "p");
+    spv_params.indexes = register_bank(index_arr_type, "idx");
+    spv_params.outs = register_bank(o_arr_type, "outs");
 
     SamplerMap samplers;
 

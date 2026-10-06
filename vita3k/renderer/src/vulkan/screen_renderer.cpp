@@ -126,6 +126,36 @@ bool ScreenRenderer::create() {
         this->surface = surface_handle;
         surface_created = true;
 #endif
+    } else if (std::holds_alternative<renderer::Ps5DisplayHandle>(display_handle)) {
+#ifdef __PROSPERO__
+        // The surface is made before the physical device is chosen, and the console has a single GPU
+        const vk::PhysicalDevice gpu = state.instance.enumeratePhysicalDevices().front();
+        const std::vector<vk::DisplayPropertiesKHR> displays = gpu.getDisplayPropertiesKHR();
+        if (displays.empty()) {
+            LOG_ERROR("The Vulkan driver exposes no VideoOut display");
+            return false;
+        }
+
+        const std::vector<vk::DisplayModePropertiesKHR> modes = gpu.getDisplayModePropertiesKHR(displays.front().display);
+        if (modes.empty()) {
+            LOG_ERROR("The VideoOut display {} has no modes", displays.front().displayName);
+            return false;
+        }
+
+        const vk::DisplayModePropertiesKHR &mode = modes.front();
+        LOG_INFO("Presenting to {} at {}x{}, {:.3f} Hz", displays.front().displayName, mode.parameters.visibleRegion.width,
+            mode.parameters.visibleRegion.height, mode.parameters.refreshRate / 1000.0);
+
+        vk::DisplaySurfaceCreateInfoKHR create_info{
+            .displayMode = mode.displayMode,
+            .planeIndex = 0,
+            .transform = vk::SurfaceTransformFlagBitsKHR::eIdentity,
+            .alphaMode = vk::DisplayPlaneAlphaFlagBitsKHR::eOpaque,
+            .imageExtent = mode.parameters.visibleRegion,
+        };
+        this->surface = state.instance.createDisplayPlaneSurfaceKHR(create_info);
+        surface_created = true;
+#endif
     } else if (const auto *handle = std::get_if<renderer::WaylandDisplayHandle>(&display_handle)) {
 #if defined(HAVE_WAYLAND)
         vk::WaylandSurfaceCreateInfoKHR create_info{};

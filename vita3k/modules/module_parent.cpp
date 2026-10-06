@@ -162,7 +162,17 @@ void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread
     }
     const ImportFn *fn = resolve_import(nid);
     if (fn) {
-        (*fn)(emuenv, cpu, thread_id);
+        try {
+            (*fn)(emuenv, cpu, thread_id);
+        } catch (const std::exception &e) {
+            // A guest can ask for things the host refuses to describe - a path its filesystem calls a name rather
+            // than a path, say. Letting that escape ends the emulator, where the game only needed an error back
+            const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+            LOG_ERROR("{} threw while serving NID {} (thread {}): {}", __func__, log_hex(nid),
+                thread ? thread->name : std::string{ "?" }, e.what());
+            if (thread)
+                write_reg(*thread->cpu, 0, static_cast<uint32_t>(SCE_ERROR_ERRNO_ENOENT));
+        }
     } else {
         const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
         // make the function return 0

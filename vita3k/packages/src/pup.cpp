@@ -215,6 +215,13 @@ static void decrypt_segments(std::ifstream &infile, const fs::path &outdir, cons
     EVP_CIPHER_free(cipher);
 }
 
+// The installer's temporary files: failing to delete one leaves it behind, it does not fail the installation
+static void remove_temporary(const fs::path &path) {
+    boost::system::error_code error;
+    fs::remove_all(path, error);
+    LOG_WARN_IF(error, "Could not delete {}: {}", path, error.message());
+}
+
 static void join_files(const fs::path &path, const std::string &filename, const fs::path &output) {
     std::vector<fs::path> files;
 
@@ -231,7 +238,7 @@ static void join_files(const fs::path &path, const std::string &filename, const 
         std::vector<char> buffer(0);
         fs_utils::read_data(file, buffer);
         fileout.write(buffer.data(), buffer.size());
-        fs::remove(file);
+        remove_temporary(file);
     }
     fileout.close();
 }
@@ -261,7 +268,7 @@ std::string install_pup(const fs::path &vita_fs_path, const fs::path &pup_path, 
     fs::path pup_dec_root = vita_fs_path / "PUP_DEC";
     if (fs::exists(pup_dec_root)) {
         LOG_WARN("Path already exists, deleting it and reinstalling");
-        fs::remove_all(pup_dec_root);
+        remove_temporary(pup_dec_root);
     }
 
     const auto update_progress = [&](const uint32_t progress) {
@@ -291,10 +298,13 @@ std::string install_pup(const fs::path &vita_fs_path, const fs::path &pup_path, 
     update_progress(70);
     if (fs::file_size(pup_dec / "os0.img") > 0)
         extract_fat(pup_dec, "os0.img", vita_fs_path);
+    update_progress(75);
     if (fs::file_size(pup_dec / "pd0.img") > 0)
         exfat::extract_exfat(pup_dec, "pd0.img", vita_fs_path);
+    update_progress(80);
     if (fs::file_size(pup_dec / "sa0.img") > 0)
         extract_fat(pup_dec, "sa0.img", vita_fs_path);
+    update_progress(85);
     if (fs::file_size(pup_dec / "vs0.img") > 0)
         extract_fat(pup_dec, "vs0.img", vita_fs_path);
     update_progress(100);
@@ -308,7 +318,7 @@ std::string install_pup(const fs::path &vita_fs_path, const fs::path &pup_path, 
     } else
         LOG_WARN("Firmware Version file not found!");
 
-    fs::remove_all(pup_dec_root);
+    remove_temporary(pup_dec_root);
 
     return fw_version;
 }

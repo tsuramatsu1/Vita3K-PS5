@@ -13,10 +13,15 @@ add_library(
 	src/mem.cpp
 )
 
+if(VITA3K_PS5_PORT)
+	target_sources(mem PRIVATE src/ps5_host_memory.cpp)
+	target_link_libraries(mem PRIVATE ps5platform)
+endif()
+
 target_include_directories(mem PUBLIC include)
 target_link_libraries(mem PUBLIC util)
 
-if(NOT ANDROID)
+if(NOT ANDROID AND NOT VITA3K_PS5_PORT)
 	add_executable(
 		mem-tests
 		tests/allocator_tests.cpp

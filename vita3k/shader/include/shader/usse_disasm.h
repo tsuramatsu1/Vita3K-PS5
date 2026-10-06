@@ -25,7 +25,8 @@
 
 namespace shader::usse::disasm {
 
-extern thread_local std::stringstream *disasm_storage;
+// constinit: no dynamic initialisation, so other translation units reference no TLS init function
+extern constinit thread_local std::stringstream *disasm_storage;
 
 //
 // Disasm helpers

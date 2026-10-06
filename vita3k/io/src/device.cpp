@@ -16,6 +16,8 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <algorithm>
+#include <mutex>
+#include <optional>
 
 #include <io/device.h>
 
@@ -91,11 +93,71 @@ std::string remove_duplicate_device(const std::string &path, VitaIoDevice &devic
     return path;
 }
 
+namespace {
+
+std::mutex external_apps_mutex;
+std::map<std::string, fs::path> external_app_directories;
+
+// path inside ux0 as app/<title_id>/rest, for an app placed outside ux0:app: its host directory joined with rest
+std::optional<fs::path> external_app_path(const fs::path &path) {
+    auto part = path.begin();
+    while (part != path.end() && (part->empty() || *part == "/"))
+        ++part;
+    if (part == path.end() || *part != "app")
+        return std::nullopt;
+    if (++part == path.end())
+        return std::nullopt;
+
+    fs::path directory;
+    {
+        const std::lock_guard<std::mutex> lock(external_apps_mutex);
+        const auto found = external_app_directories.find(part->string());
+        if (found == external_app_directories.end())
+            return std::nullopt;
+        directory = found->second;
+    }
+    for (++part; part != path.end(); ++part)
+        directory /= *part;
+    return directory;
+}
+
+} // namespace
+
 fs::path construct_emulated_path(const VitaIoDevice dev, const fs::path &path, const fs::path &base_path, const bool redirect_pwd, const std::string &ext) {
     if (redirect_pwd && dev == VitaIoDevice::host0) {
         return fs::current_path() / path;
     }
+    if (dev == VitaIoDevice::ux0) {
+        if (auto external = external_app_path(path)) {
+            if (!ext.empty())
+                external->replace_extension(ext);
+            return external->generic_path();
+        }
+    }
     return fs_utils::construct_file_name(base_path, get_device_string(dev, false), path, ext);
+}
+
+void set_external_app(const fs::path &vita_fs_path, const std::string &title_id, const fs::path &host_directory) {
+    boost::system::error_code error;
+    if (fs::exists(vita_fs_path / "ux0/app" / title_id, error))
+        return;
+    const std::lock_guard<std::mutex> lock(external_apps_mutex);
+    external_app_directories[title_id] = host_directory;
+}
+
+std::map<std::string, fs::path> external_apps() {
+    const std::lock_guard<std::mutex> lock(external_apps_mutex);
+    return external_app_directories;
+}
+
+fs::path app_directory(const fs::path &vita_fs_path, const std::string &title_id) {
+    {
+        const std::lock_guard<std::mutex> lock(external_apps_mutex);
+        const auto found = external_app_directories.find(title_id);
+        if (found != external_app_directories.end())
+            return found->second;
+    }
+    return vita_fs_path / "ux0/app" / title_id;
 }
 
 } // namespace device

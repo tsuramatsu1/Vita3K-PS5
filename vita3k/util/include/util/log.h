@@ -66,6 +66,9 @@ ExitCode init(const Root &root_paths, bool use_stdout);
 void set_level(spdlog::level::level_enum log_level);
 ExitCode add_sink(const fs::path &log_path);
 void set_log_callback(std::function<void(std::string, int)> cb);
+// Writes out whatever the logging thread still holds. Worth calling before leaving, since the lines still queued
+// are the ones that say why
+void flush();
 
 } // namespace logging
 

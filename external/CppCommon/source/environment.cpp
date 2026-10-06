@@ -41,7 +41,7 @@ std::string Environment::OSVersion() {
         return result;
 
     return "<apple>";
-#elif defined(__CYGWIN__)
+#elif defined(__CYGWIN__) || defined(__FreeBSD__)
     struct utsname name;
     if (uname(&name) == 0) {
         std::string result(name.sysname);

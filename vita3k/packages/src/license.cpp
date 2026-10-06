@@ -21,6 +21,7 @@
  */
 
 #include <emuenv/state.h>
+#include <io/device.h>
 
 #include <packages/license.h>
 
@@ -102,7 +103,7 @@ void get_license(EmuEnvState &emuenv, const std::string &title_id, const std::st
             fs::remove(license_path);
 
         LOG_WARN("License file is corrupted or missing at: {}, using default value.", license_path);
-        const auto RETAIL_APP_PATH{ emuenv.vita_fs_path / "ux0/app" / title_id / "sce_sys/retail/livearea" };
+        const auto RETAIL_APP_PATH{ device::app_directory(emuenv.vita_fs_path, title_id) / "sce_sys/retail/livearea" };
         if (fs::exists(RETAIL_APP_PATH))
             license_buf.sku_flag = 1;
         else

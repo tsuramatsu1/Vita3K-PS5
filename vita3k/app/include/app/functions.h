@@ -32,6 +32,10 @@ struct EmuEnvState;
 struct AppLaunchRequest;
 class Root;
 
+namespace platform {
+struct RuntimeConfig;
+}
+
 namespace app {
 
 struct LaunchRuntimeMetrics {
@@ -66,7 +70,7 @@ enum class AppRunType {
     Extracted,
 };
 
-bool init_paths(Root &root_paths);
+bool init_paths(Root &root_paths, const platform::RuntimeConfig *runtime_cfg = nullptr);
 bool init(EmuEnvState &state, Config &cfg, const Root &root_paths);
 void shutdown_app_runtime(EmuEnvState &state);
 void reset_app_state(EmuEnvState &state);
