@@ -90,3 +90,6 @@ fastlane/readme.md
 
 # Copilot local config
 .github/copilot-instructions.md
+/graphify-out
+/vita3k/graphify-out
+/release

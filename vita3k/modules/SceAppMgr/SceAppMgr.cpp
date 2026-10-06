@@ -17,11 +17,15 @@
 
 #include "SceAppMgr.h"
 
+#include <io/device.h>
 #include <io/state.h>
 #include <kernel/state.h>
 #include <packages/sfo.h>
 #include <renderer/state.h>
+#include <util/string_utils.h>
 #include <util/tracy.h>
+
+#include <boost/filesystem/operations.hpp>
 
 TRACY_MODULE_NAME(SceAppMgr);
 
@@ -404,6 +408,32 @@ EXPORT(int, _sceAppMgrLaunchVideoStreamingApp) {
     return UNIMPLEMENTED();
 }
 
+// A collection can ask for a self whose name differs only in case from the one on disk: God of War Collection asks
+// for GOW1.self beside gow1.self. sceIoOpen and the module loader already fall back to a case-insensitive search,
+// and the exec path needs the same or the call fails on a case-sensitive filesystem
+static bool resolve_exec_path_case(EmuEnvState &emuenv, std::string &exec_path) {
+    const fs::path app_root = device::construct_emulated_path(VitaIoDevice::ux0, fs::path("app") / emuenv.io.app_path, emuenv.vita_fs_path);
+    if (!fs::exists(app_root)) {
+        return false;
+    }
+
+    const std::string root = app_root.generic_string();
+    const std::string wanted = string_utils::tolower(fs::path(exec_path).generic_string());
+    for (const auto &entry : fs::recursive_directory_iterator(app_root)) {
+        if (!fs::is_regular_file(entry.path())) {
+            continue;
+        }
+
+        const std::string relative = entry.path().generic_string().substr(root.size() + 1);
+        if (string_utils::tolower(relative) == wanted) {
+            exec_path = relative;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 EXPORT(SceInt32, _sceAppMgrLoadExec, const char *appPath, Ptr<char> const argv[], const SceAppMgrLoadExecOptParam *optParam) {
     TRACY_FUNC(_sceAppMgrLoadExec, appPath, argv, optParam);
     if (optParam)
@@ -420,7 +450,13 @@ EXPORT(SceInt32, _sceAppMgrLoadExec, const char *appPath, Ptr<char> const argv[]
 
     // Load exec executable
     vfs::FileBuffer exec_buffer;
-    if (vfs::read_app_file(exec_buffer, emuenv.vita_fs_path, emuenv.io.app_path, exec_path)) {
+    bool exec_found = vfs::read_app_file(exec_buffer, emuenv.vita_fs_path, emuenv.io.app_path, exec_path);
+    if (!exec_found && emuenv.io.case_isens_find_enabled && resolve_exec_path_case(emuenv, exec_path)) {
+        LOG_INFO("Found self on case-sensitive filesystem at {}", exec_path);
+        exec_found = vfs::read_app_file(exec_buffer, emuenv.vita_fs_path, emuenv.io.app_path, exec_path);
+    }
+
+    if (exec_found) {
         std::vector<std::string> exec_argv;
         if (argv && argv->get(emuenv.mem)) {
             size_t args = 0;

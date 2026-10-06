@@ -376,7 +376,7 @@ bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPe
             --it;
     }
 
-    while (it != state.protect_tree.end() && it->first < addr + size) {
+    while (it != state.protect_tree.end() && it->first < addr + protect.size) {
         const Address start = std::min(it->first, addr);
         protect.size = std::max(it->first + it->second.size, addr + protect.size) - start;
         addr = start;

@@ -75,6 +75,10 @@ constexpr const char *BOOT_ARGUMENT = "--boot";
 constexpr const char *APP_DIRECTORY_ARGUMENT = "--app-directory";
 // Set when the title restarts itself, so the splash plays when the player opened it and not on the way back
 constexpr const char *NO_SPLASH_ARGUMENT = "--no-splash";
+// With --boot, the self inside the app to run instead of its eboot, and one --self-arg per argument to pass it.
+// sceAppMgrLoadExec is served by restarting the title with these rather than relaunching inside this process
+constexpr const char *SELF_ARGUMENT = "--self";
+constexpr const char *SELF_ARG_ARGUMENT = "--self-arg";
 constexpr const char *INSTALL_DIRECTORY_NAME = "install";
 constexpr int USB_DRIVES = 8;
 constexpr int USB_SEARCH_DEPTH = 3;
@@ -568,10 +572,49 @@ bool exit_shortcut_held() {
         sceKernelUsleep(100000);
 }
 
-int run_app(EmuEnvState &emuenv, const std::string &title_id) {
+// The front end has nothing to draw while a game runs, so it idles at roughly a frame between polls
+constexpr int FRAME_INTERVAL_MS = 16;
+
+// Serves sceAppMgrLoadExec by restarting the title to run the next self, which is how picking a game from the
+// front end already works. Relaunching inside this process means stopping the session while the game's own threads
+// are still live, and that faults on host state they are holding
+[[noreturn]] void restart_for_launch(const AppLaunchRequest &launch_request) {
+    LOG_INFO("Restarting to run {} of {}", launch_request.self_path, launch_request.app_path);
+    logging::flush();
+
+    std::vector<std::string> owned{ BOOT_ARGUMENT, launch_request.app_path, NO_SPLASH_ARGUMENT };
+    const auto external = device::external_apps();
+    if (const auto found = external.find(launch_request.app_path); found != external.end()) {
+        owned.emplace_back(APP_DIRECTORY_ARGUMENT);
+        owned.push_back(found->second.string());
+    }
+    if (!launch_request.self_path.empty()) {
+        owned.emplace_back(SELF_ARGUMENT);
+        owned.push_back(launch_request.self_path);
+    }
+    for (const std::string &argument : launch_request.argv) {
+        owned.emplace_back(SELF_ARG_ARGUMENT);
+        owned.push_back(argument);
+    }
+
+    std::vector<const char *> arguments;
+    arguments.reserve(owned.size() + 1);
+    for (const std::string &argument : owned)
+        arguments.push_back(argument.c_str());
+    arguments.push_back(nullptr);
+
+    const int refused = sceSystemServiceLoadExec("/app0/eboot.bin", arguments.data());
+    LOG_ERROR("The system refused to restart the title: 0x{:X}", static_cast<unsigned>(refused));
+    // LoadExec does not return on success; park rather than run on with a session that is about to be torn down
+    for (;;)
+        sceKernelUsleep(100000);
+}
+
+int run_app(EmuEnvState &emuenv, const std::string &title_id, const std::string &self_path, const std::vector<std::string> &self_argv) {
     app::AppSessionController session(emuenv);
     Ps5FrameHost frame_host;
-    AppLaunchRequest launch_request{ .app_path = title_id };
+    AppLaunchRequest launch_request{ .app_path = title_id, .self_path = self_path, .argv = self_argv,
+        .reason = self_path.empty() ? AppLaunchReason::User : AppLaunchReason::LoadExec };
 
     while (true) {
         LOG_INFO("Booting {}", launch_request.app_path);
@@ -609,17 +652,26 @@ int run_app(EmuEnvState &emuenv, const std::string &title_id) {
             app::update_runtime_metrics(emuenv, runtime_metrics);
             platform::keep_awake();
             feed_touchpad(emuenv, platform::current_pad());
-            SDL_Delay(16);
+
+            // request_process_exit only posts the request: the guest keeps running until the session is torn down,
+            // and a game that has just called sceAppMgrLoadExec spends that window in its own shutdown path. Picking
+            // the request up once a frame leaves it up to a frame to fault on state the relaunch is about to take
+            // away, so idle in short steps and watch for the request rather than sleeping through the whole frame
+            for (int slept = 0; slept < FRAME_INTERVAL_MS && !next_launch_request && session.is_running(); slept++) {
+                SDL_Delay(1);
+                next_launch_request = emuenv.take_app_launch_request();
+            }
         }
 
-        if (!next_launch_request) {
+        // A ProcessExit request is only a notification that the guest ended and carries no app to boot. Returning
+        // from here would end the title itself and drop the player on the console's home screen rather than the list
+        if (!next_launch_request || next_launch_request->reason == AppLaunchReason::ProcessExit) {
+            LOG_INFO("{} exited", launch_request.app_path);
             session.stop(app::AppSessionStopReason::UserRequest);
-            return 0;
+            return_to_game_list();
         }
 
-        launch_request = std::move(*next_launch_request);
-        LOG_INFO("Relaunching in-process with self '{}'", launch_request.self_path);
-        session.stop(app::AppSessionStopReason::Relaunch);
+        restart_for_launch(*next_launch_request);
     }
 }
 
@@ -630,6 +682,16 @@ std::string argument_value(int argc, char *argv[], std::string_view name) {
             return argv[i + 1];
     }
     return {};
+}
+
+// Every occurrence, in order: a self can be given more than one argument
+std::vector<std::string> argument_values(int argc, char *argv[], std::string_view name) {
+    std::vector<std::string> values;
+    for (int i = 0; i + 1 < argc; i++) {
+        if (std::string_view(argv[i]) == name)
+            values.emplace_back(argv[i + 1]);
+    }
+    return values;
 }
 
 // A Vita app's folder has a param.sfo and an eboot.bin that is a Vita SELF ("SCE\0"); a PS4 app's has both too,
@@ -787,7 +849,8 @@ int main(int argc, char *argv[]) {
                 if (!app_directory.empty())
                     device::set_external_app(emuenv->vita_fs_path, boot_title_id, app_directory);
                 refresh_controllers(emuenv->ctrl, *emuenv);
-                exit_code = run_app(*emuenv, boot_title_id);
+                exit_code = run_app(*emuenv, boot_title_id, argument_value(argc, argv, SELF_ARGUMENT),
+                    argument_values(argc, argv, SELF_ARG_ARGUMENT));
             }
         }
     }
