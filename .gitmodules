@@ -53,13 +53,13 @@
 	url = https://github.com/jbeder/yaml-cpp
 [submodule "external/psvpfstools"]
 	path = external/psvpfstools
-	url = https://github.com/Vita3K/psvpfstools.git
+	url = https://github.com/tsuramatsu1/psvpfstools.git
 [submodule "external/xxHash"]
 	path = external/xxHash
 	url = https://github.com/Cyan4973/xxHash
 [submodule "external/dynarmic"]
 	path = external/dynarmic
-	url = https://github.com/Vita3K/dynarmic.git
+	url = https://github.com/tsuramatsu1/dynarmic.git
 [submodule "external/fmt"]
 	path = external/fmt
 	url = https://github.com/fmtlib/fmt.git
