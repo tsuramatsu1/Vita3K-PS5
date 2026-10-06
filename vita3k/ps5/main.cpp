@@ -820,6 +820,23 @@ int main(int argc, char *argv[]) {
 
     report_crypto_speed();
 
+    // RADV reads its own debug switches from the environment. The console has no shell to set them in, so one line
+    // in config/radv-debug.txt is passed through: it lets a driver feature be turned off and the result seen without
+    // rebuilding the driver or the emulator. Empty or absent means RADV's defaults
+    {
+        const fs::path radv_debug_path = root_paths.get_config_path() / "radv-debug.txt";
+        std::ifstream radv_debug_file(radv_debug_path.string());
+        std::string radv_debug_options;
+        if (radv_debug_file && std::getline(radv_debug_file, radv_debug_options)) {
+            while (!radv_debug_options.empty() && std::isspace(static_cast<unsigned char>(radv_debug_options.back())))
+                radv_debug_options.pop_back();
+            if (!radv_debug_options.empty()) {
+                setenv("RADV_DEBUG", radv_debug_options.c_str(), 1);
+                LOG_INFO("RADV_DEBUG set to '{}' from {}", radv_debug_options, radv_debug_path);
+            }
+        }
+    }
+
     LOG_INFO("{} on {}", window_title, platform::platform_name(runtime_cfg.kind));
     if (!stderr_captured)
         LOG_WARN("The log does not reach klog, only {}", root_paths.get_log_path());

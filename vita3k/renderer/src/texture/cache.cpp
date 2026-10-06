@@ -26,6 +26,7 @@
 #include <util/log.h>
 
 #include <algorithm>
+#include <set>
 #include <cstring>
 #include <numeric>
 // The PS5's CPU is fixed, so xxHash is built without runtime dispatch there
@@ -741,6 +742,22 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
         configure = true;
 
     select(index, gxm_texture);
+
+    // DIAGNOSTIC: one line per distinct texture configuration a game uses, so the set a game that renders wrong
+    // needs can be compared against the set a game that renders correctly needs
+    {
+        const SceGxmTextureFormat diag_format = gxm::get_format(gxm_texture);
+        const SceGxmTextureBaseFormat diag_base = gxm::get_base_format(diag_format);
+        const uint32_t diag_type = static_cast<uint32_t>(gxm_texture.texture_type());
+        const uint64_t diag_key = (static_cast<uint64_t>(diag_format) << 8) | diag_type;
+        static std::set<uint64_t> diag_seen;
+        if (diag_seen.insert(diag_key).second) {
+            LOG_INFO("TEXDIAG format=0x{:08X} base=0x{:08X} type=0x{:X} {}x{} mips={}",
+                static_cast<uint32_t>(diag_format), static_cast<uint32_t>(diag_base), diag_type,
+                gxm::get_width(gxm_texture), gxm::get_height(gxm_texture),
+                static_cast<uint32_t>(gxm_texture.true_mip_count()));
+        }
+    }
 
     if (configure) {
         bool need_configure = true;
